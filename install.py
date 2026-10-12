@@ -56,6 +56,15 @@ def install(source, home, python, user, system=False, plan=False):
     if system or os.geteuid()==0:subprocess.run(['launchctl','bootout','system/'+label],capture_output=True)
     elif Path('/Library/LaunchDaemons',label+'.plist').exists():
         raise ValueError('A system service is installed; update it using sudo --system')
+    if system:
+        login_plist=home/'Library/LaunchAgents'/(label+'.plist')
+        if login_plist.exists():
+            previous=login_plist.read_bytes()
+            if plistlib.loads(previous).get('Label')!=label:raise ValueError('Unexpected login plist owner')
+            history=state/'startup-history';history.mkdir(exist_ok=True,mode=0o700)
+            saved=history/('login-'+hashlib.sha256(previous).hexdigest()[:16]+'.plist')
+            if not saved.exists():saved.write_bytes(previous)
+            login_plist.unlink()
     plist.parent.mkdir(parents=True,exist_ok=True)
     plist.write_bytes(plistlib.dumps(doc));plist.chmod(0o644)
     if system:
