@@ -44,7 +44,7 @@ class Handler(BaseHTTPRequestHandler):
                 progress=store.root/'progress'/(result['id']+'.json')
                 if progress.exists():result['progress']=json.loads(progress.read_text())
             elif self.command=='POST' and path=='/project':result=store.add_project(payload)
-            elif self.command=='POST' and path=='/task':result=store.register(payload['project'],payload.get('id'),payload.get('urgent',False),payload.get('separate',False))
+            elif self.command=='POST' and path=='/task':result=store.register(payload['project'],payload.get('id'),payload.get('urgent',False),payload.get('separate',False),payload.get('repairsBatch'))
             elif self.command=='POST' and path=='/ready':result=store.ready(payload['id'],payload['sha'],payload['validation'])
             elif self.command=='POST' and path=='/heartbeat':result=store.touch(payload['id'],payload.get('state'))
             elif self.command=='POST' and path=='/resume':result=store.resume(payload['batch'])

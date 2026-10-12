@@ -29,9 +29,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, scope TEXT NOT NULL, config TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, project TEXT NOT NULL, state TEXT NOT NULL,
                 sha TEXT, validation TEXT, created REAL NOT NULL, updated REAL NOT NULL, ready_at REAL,
-                urgent INTEGER NOT NULL DEFAULT 0, separate INTEGER NOT NULL DEFAULT 0, batch TEXT);
+                urgent INTEGER NOT NULL DEFAULT 0, separate INTEGER NOT NULL DEFAULT 0, batch TEXT, repairs_batch TEXT, recovered_by TEXT);
             CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, project TEXT NOT NULL, scope TEXT NOT NULL,
-                state TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, data TEXT NOT NULL, error TEXT);
+                state TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, data TEXT NOT NULL, error TEXT, recovery_of TEXT);
             CREATE TABLE IF NOT EXISTS leases(scope TEXT PRIMARY KEY, owner TEXT NOT NULL, epoch INTEGER NOT NULL, expires REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS steps(batch TEXT NOT NULL, phase TEXT NOT NULL, state TEXT NOT NULL,
                 result TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(batch,phase));
@@ -40,6 +40,11 @@ class Store:
             CREATE INDEX IF NOT EXISTS task_project ON tasks(project,state,batch);
             CREATE INDEX IF NOT EXISTS batch_scope ON batches(scope,state);
             ''')
+            task_columns={r[1] for r in db.execute('PRAGMA table_info(tasks)')}
+            if 'repairs_batch' not in task_columns:db.execute('ALTER TABLE tasks ADD COLUMN repairs_batch TEXT')
+            if 'recovered_by' not in task_columns:db.execute('ALTER TABLE tasks ADD COLUMN recovered_by TEXT')
+            batch_columns={r[1] for r in db.execute('PRAGMA table_info(batches)')}
+            if 'recovery_of' not in batch_columns:db.execute('ALTER TABLE batches ADD COLUMN recovery_of TEXT')
         self.path.chmod(0o600)
 
     @contextlib.contextmanager
@@ -99,18 +104,26 @@ class Store:
             db.execute('INSERT OR REPLACE INTO projects VALUES(?,?,?)', (config['id'],config['scope'],encode(config)))
         return config
 
-    def register(self, project, task_id=None, urgent=False, separate=False):
+    def register(self, project, task_id=None, urgent=False, separate=False, repairs_batch=None):
         self.project(project)
         task_id = task_id or str(uuid.uuid4())
         now = self.clock()
         with self.tx() as db:
+            parent=None
+            if repairs_batch:
+                parent=db.execute('SELECT * FROM batches WHERE id=?',(repairs_batch,)).fetchone()
+                if not parent or parent['project']!=project or parent['state']!='failed':raise Conflict('Recovery must reference a failed batch in this project scope')
+                if db.execute('SELECT 1 FROM batches WHERE recovery_of=?',(repairs_batch,)).fetchone():
+                    raise Conflict('Recovery must reference the latest failed leaf batch')
             old = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
             if old:
                 if old['project'] != project:
                     raise Conflict('Task ID belongs to another project')
+                if old['repairs_batch'] != repairs_batch:
+                    raise Conflict('Task ID is already registered with a different recovery target')
                 return dict(old)
-            db.execute('INSERT INTO tasks(id,project,state,created,updated,urgent,separate) VALUES(?,?,?,?,?,?,?)',
-                       (task_id,project,'active',now,now,int(urgent),int(separate)))
+            db.execute('INSERT INTO tasks(id,project,state,created,updated,urgent,separate,repairs_batch) VALUES(?,?,?,?,?,?,?,?)',
+                       (task_id,project,'active',now,now,int(urgent),int(separate),repairs_batch))
             value=dict(db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
         value['validation']=json.loads(value['validation']) if value['validation'] else None
         return value
@@ -170,9 +183,10 @@ class Store:
         now = self.clock()
         config = self.project(project)
         with self.tx() as db:
-            if db.execute("SELECT 1 FROM batches WHERE scope=? AND state!='complete'", (config['scope'],)).fetchone():
-                return None
-            tasks = [dict(r) for r in db.execute("SELECT * FROM tasks WHERE project=? AND state='ready' AND batch IS NULL ORDER BY ready_at,rowid", (project,))]
+            active=db.execute("SELECT 1 FROM batches WHERE scope=? AND state NOT IN ('complete','failed')",(config['scope'],)).fetchone()
+            if active:return None
+            parent=db.execute("SELECT * FROM batches WHERE scope=? AND state='failed' AND id NOT IN (SELECT recovery_of FROM batches WHERE recovery_of IS NOT NULL) ORDER BY created DESC LIMIT 1",(config['scope'],)).fetchone()
+            tasks=[dict(r) for r in db.execute("SELECT * FROM tasks WHERE project=? AND state='ready' AND batch IS NULL AND repairs_batch IS ? ORDER BY ready_at,rowid",(project,parent['id'] if parent else None))]
             if not tasks:
                 return None
             peers = [dict(r) for r in db.execute("SELECT * FROM tasks WHERE project=? AND state IN ('active','closing') AND batch IS NULL AND updated>?", (project,now-300))]
@@ -223,10 +237,11 @@ class Store:
         now = self.clock(); batch_id=str(uuid.uuid4())
         with self.tx() as db:
             self._guard(db,config['scope'],owner,epoch)
-            if db.execute("SELECT 1 FROM batches WHERE scope=? AND state!='complete'", (config['scope'],)).fetchone():
-                return None
-            # Re-read inside the transaction so ready/withdrawn mutations cannot race selection.
-            tasks=[dict(r) for r in db.execute("SELECT * FROM tasks WHERE project=? AND state='ready' AND batch IS NULL ORDER BY ready_at,rowid", (project,))]
+            active=db.execute("SELECT 1 FROM batches WHERE scope=? AND state NOT IN ('complete','failed')",(config['scope'],)).fetchone()
+            if active:return None
+            parent=db.execute("SELECT * FROM batches WHERE scope=? AND state='failed' AND id NOT IN (SELECT recovery_of FROM batches WHERE recovery_of IS NOT NULL) ORDER BY created DESC LIMIT 1",(config['scope'],)).fetchone()
+            # Recovery tasks explicitly link to the latest failed batch; unrelated ready work cannot unlock it.
+            tasks=[dict(r) for r in db.execute("SELECT * FROM tasks WHERE project=? AND state='ready' AND batch IS NULL AND repairs_batch IS ? ORDER BY ready_at,rowid",(project,parent['id'] if parent else None))]
             if not tasks:
                 return None
             tasks=self._select(tasks)
@@ -234,9 +249,15 @@ class Store:
             deadline=min(t['ready_at'] for t in tasks)+(180 if any(t['state']=='closing' for t in peers) else 90)
             if peers and not any(t['urgent'] or t['separate'] for t in tasks) and now<deadline:
                 return None
-            data={'id':batch_id,'project':project,'scope':config['scope'],'tasks':[{'id':t['id'],'sha':t['sha'],'validation':json.loads(t['validation'])} for t in tasks],
+            new_tasks=[{'id':t['id'],'sha':t['sha'],'validation':json.loads(t['validation'])} for t in tasks]
+            parent_data=json.loads(parent['data']) if parent else {}
+            inherited=parent_data.get('tasks',[])
+            task_map={t['id']:t for t in [*inherited,*new_tasks]}
+            lineage=list(parent_data.get('recoveryChain',[]))+([parent['id']] if parent else [])
+            data={'id':batch_id,'project':project,'scope':config['scope'],'recoveryOf':parent['id'] if parent else None,
+                  'recoveryChain':lineage,'tasks':list(task_map.values()),'newTaskIds':[t['id'] for t in new_tasks],
                   'config':config,'workspace':str(self.root/'worktrees'/batch_id),'results':{}}
-            db.execute('INSERT INTO batches VALUES(?,?,?,?,?,?,?,NULL)', (batch_id,project,config['scope'],'integrating',now,now,encode(data)))
+            db.execute('INSERT INTO batches(id,project,scope,state,created,updated,data,error,recovery_of) VALUES(?,?,?,?,?,?,?,NULL,?)', (batch_id,project,config['scope'],'integrating',now,now,encode(data),parent['id'] if parent else None))
             db.executemany("UPDATE tasks SET batch=?,state='batched' WHERE id=?", [(batch_id,t['id']) for t in tasks])
             self._event(db,batch_id,'selected',{'taskIds':[t['id'] for t in tasks]},now)
         return data
@@ -259,7 +280,13 @@ class Store:
                 raise Conflict('Frozen description is immutable')
             db.execute('UPDATE batches SET data=?,state=?,updated=?,error=NULL WHERE id=?', (encode(data),state,now,batch_id))
             if state=='complete':
-                db.execute("UPDATE tasks SET state='complete' WHERE batch=?",(batch_id,))
+                for task_id in data.get('newTaskIds',[]):
+                    db.execute("UPDATE tasks SET state='complete' WHERE batch=? AND id=?",(batch_id,task_id))
+                if data.get('recoveryOf'):
+                    for task in data['tasks']:
+                        old=db.execute('SELECT batch,state FROM tasks WHERE id=?',(task['id'],)).fetchone()
+                        if old and old['batch']!=batch_id and old['state'] in ('batched','complete','recovered'):
+                            db.execute("UPDATE tasks SET state='recovered',recovered_by=? WHERE id=?",(batch_id,task['id']))
             self._event(db,batch_id,state,{},now)
 
     def step(self, batch_id, phase, state, result, owner, epoch):
@@ -280,10 +307,10 @@ class Store:
         row=self.batch(batch_id)
         with self.tx() as db:
             lease=db.execute('SELECT expires FROM leases WHERE scope=?',(row['scope'],)).fetchone()
-            if lease and lease[0]>self.clock():
-                raise Conflict('An owner still holds the lease')
-            if row['state'] not in ('failed','integrating','frozen','running','recovering'):
-                raise Conflict('Batch cannot be resumed')
+            if lease and lease[0]>self.clock():raise Conflict('An owner still holds the lease')
+            if row['state']=='failed':raise Conflict('Failed batch history is immutable; register a linked repair task with --repairs-batch '+batch_id)
+            if row['state'] not in ('integrating','frozen','running','recovering'):
+                raise Conflict('Only an interrupted, non-failed batch can resume')
             db.execute("UPDATE batches SET state='recovering',error=NULL WHERE id=?",(batch_id,))
             self._event(db,batch_id,'resume-requested',{},self.clock())
         return self.batch(batch_id)

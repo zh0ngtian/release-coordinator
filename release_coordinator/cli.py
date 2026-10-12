@@ -35,7 +35,7 @@ def main(argv=None):
     sub=p.add_subparsers(dest='command',required=True)
     sub.add_parser('serve');sub.add_parser('health')
     project=sub.add_parser('project');project.add_argument('--config',required=True)
-    register=sub.add_parser('register');register.add_argument('--project',required=True);register.add_argument('--task');register.add_argument('--urgent',action='store_true');register.add_argument('--separate',action='store_true')
+    register=sub.add_parser('register');register.add_argument('--project',required=True);register.add_argument('--task');register.add_argument('--urgent',action='store_true');register.add_argument('--separate',action='store_true');register.add_argument('--repairs-batch')
     ready=sub.add_parser('ready');ready.add_argument('--task',required=True);ready.add_argument('--sha',required=True);ready.add_argument('--validation',required=True)
     hb=sub.add_parser('heartbeat');hb.add_argument('--task',required=True);hb.add_argument('--state',choices=['active','closing','blocked','withdrawn'])
     status=sub.add_parser('status');status.add_argument('--project');status.add_argument('--task')
@@ -48,7 +48,7 @@ def main(argv=None):
         if args.command=='serve':serve(root);return 0
         if args.command=='health':result=call(root,'GET','/health')
         elif args.command=='project':result=call(root,'POST','/project',json.loads(Path(args.config).expanduser().read_text()))
-        elif args.command=='register':result=call(root,'POST','/task',{'project':args.project,'id':args.task,'urgent':args.urgent,'separate':args.separate})
+        elif args.command=='register':result=call(root,'POST','/task',{'project':args.project,'id':args.task,'urgent':args.urgent,'separate':args.separate,'repairsBatch':args.repairs_batch})
         elif args.command=='ready':result=call(root,'POST','/ready',{'id':args.task,'sha':args.sha,'validation':json.loads(Path(args.validation).expanduser().read_text())})
         elif args.command=='heartbeat':result=call(root,'POST','/heartbeat',{'id':args.task,'state':args.state})
         elif args.command=='batch':result=call(root,'GET','/batch/'+args.id)
@@ -58,8 +58,8 @@ def main(argv=None):
             while True:
                 snap=call(root,'GET','/status');task=next((t for t in snap['tasks'] if t['id']==args.task),None)
                 if not task:raise ValueError('Unknown task')
-                batch=next((b for b in snap['batches'] if b['id']==task['batch']),None)
-                if task['state']=='complete' or (batch and batch['state']=='failed') or time.monotonic()>=deadline:
+                batch=next((b for b in snap['batches'] if b['id']==(task.get('recovered_by') or task['batch'])),None)
+                if task['state'] in ('complete','recovered') or (batch and batch['state']=='failed') or time.monotonic()>=deadline:
                     result={'task':task,'batch':batch};break
                 time.sleep(min(2,max(0,deadline-time.monotonic())))
         else:
@@ -69,7 +69,7 @@ def main(argv=None):
             if args.task:
                 task=next((t for t in result['tasks'] if t['id']==args.task),None)
                 if not task:raise ValueError('Unknown task')
-                result={'task':task,'batch':next((b for b in result['batches'] if b['id']==task['batch']),None)}
+                result={'task':task,'batch':next((b for b in result['batches'] if b['id']==(task.get('recovered_by') or task['batch'])),None)}
         print(json.dumps(result,ensure_ascii=False,indent=2));return 0
     except (ValueError,OSError) as e:
         print('release-coordinator: '+str(e),file=sys.stderr);return 1

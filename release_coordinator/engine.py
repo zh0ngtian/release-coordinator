@@ -93,6 +93,10 @@ class Worker:
             raise RuntimeError('Unexpected integration worktree')
         if (Path(self.git(work,'rev-parse','--git-dir'))/'MERGE_HEAD').exists():
             raise RuntimeError('Resolve and commit the merge conflict in the retained worktree, then resume')
+        if data.get('recoveryOf'):
+            self.git(work,'checkout','--detach','origin/'+self.config['branch'])
+            self.git(work,'reset','--hard','origin/'+self.config['branch'])
+            self.git(work,'clean','-ffd')
         for task in data['tasks']:
             # Fetch by immutable SHA; readiness is never a mutable branch name.
             self.git(repo,'fetch','origin',task['sha'])
@@ -184,7 +188,8 @@ class Worker:
         except Exception as e:
             if data:
                 with contextlib.suppress(Conflict):
-                    if self.stop.is_set():self.store.save(data['id'],self.owner,self.epoch,data,'recovering')
+                    if self.stop.is_set() or data.get('frozen') and self.store.batch(data['id'])['state'] in ('running','recovering'):
+                        self.store.save(data['id'],self.owner,self.epoch,data,'recovering')
                     else:self.store.fail(data['id'],self.owner,self.epoch,e)
             else:raise
             return None
@@ -212,8 +217,11 @@ class Scheduler:
                 batch=None
                 if unresolved:
                     row=unresolved[0]
-                    if row['project']!=config['id'] or row['state']=='failed':continue
-                    batch=row['id']
+                    if row['project']!=config['id']:continue
+                    if row['state']=='failed':
+                        candidate=self.store.due(config['id'])
+                        if not candidate or not candidate['due']:continue
+                    else:batch=row['id']
                 else:
                     candidate=self.store.due(config['id'])
                     if not candidate or not candidate['due']:continue

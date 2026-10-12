@@ -56,7 +56,7 @@ Copy [project.example.json](examples/project.example.json) to a private location
 ~/.local/bin/releasectl status --task MY_TASK
 ```
 
-`ready` authorizes the configured adapter's automatic release after collection. Register at task start so other tasks are visible; heartbeat at least once a minute while active. A task heartbeat is not the publisher lease heartbeat. Push the development commit to the configured remote before declaring it ready. Required validation names must be passed. `--urgent` skips collection; `--separate` releases that task alone. Failed batches block their scope until explicitly resumed or repaired; unrelated projects continue.
+`ready` authorizes the configured adapter's automatic release after collection. Register at task start so other tasks are visible; heartbeat at least once a minute while active. A task heartbeat is not the publisher lease heartbeat. Push the development commit to the configured remote before declaring it ready. Required validation names must be passed. `--urgent` skips collection; `--separate` releases that task alone. Interrupted non-failed batches resume after lease expiry; immutable failed batches block only their scope until a linked repair batch completes. Unrelated projects continue.
 
 ## Adapter contract
 
@@ -84,10 +84,10 @@ A manifest cannot embed the hash of its own commit. CI should derive the final S
 
 ```sh
 ~/.local/bin/releasectl batch --id BATCH_ID
-~/.local/bin/releasectl resume --batch BATCH_ID
+~/.local/bin/releasectl register --project MY_PROJECT --task REPAIR_TASK --repairs-batch FAILED_BATCH_ID
 ```
 
-Resume is rejected while a valid owner lease exists. After interruption, reconcile remote effects before doing more work. The original frozen batch and diagnostics remain. Resolve and commit an integration conflict in the retained worktree before resuming; do not edit a frozen worktree or move a published tag. If a frozen commit cannot be advanced safely or an immutable stage is incomplete, the project adapter must guide a linked repair with a higher version as required by the project.
+Interrupted integrating/building batches resume automatically after lease expiry; recovery reconciles remote effects first. A failed batch remains immutable and cannot be resumed in place. Register a new task explicitly linked with `--repairs-batch`, push its fixed repair SHA, and mark it ready; the child batch includes the failed task lineage. Resolve an integration conflict in its retained worktree and use that resolution commit in the linked repair task. Never edit a frozen worktree or move a published tag. If an immutable stage is incomplete, the adapter selects a linked repair using a higher version as required by the project. A successful child marks its inherited tasks `recovered` and publishes one receipt; the original failure record remains available.
 
 Update by fetching a reviewed revision, running tests and re-running the installer in the already installed startup mode. Old runtime directories, state and historical artifacts remain. Service shutdown terminates its local command groups, preserves recovery state and does not cancel remote CI jobs. Adapters on recovery check remote status again.
 

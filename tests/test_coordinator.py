@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -70,7 +71,18 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(Conflict):self.store.resume(batch['id'])
         self.ready('late');self.assertIsNone(self.store.due('one'))
         self.ready('other','two');self.assertTrue(self.store.due('two')['due'])
-        self.store.release(scope,'owner',epoch);self.assertEqual(self.store.resume(batch['id'])['state'],'recovering')
+        with self.assertRaises(Conflict):self.store.register('one','bad-repair',repairs_batch='missing')
+
+    def test_repair_must_link_to_latest_failed_leaf(self):
+        self.ready('first');scope=self.store.project('one')['scope'];epoch=self.store.claim(scope,'owner')
+        parent=self.store.create_batch('one','owner',epoch);self.store.fail(parent['id'],'owner',epoch,'first failure');self.store.release(scope,'owner',epoch)
+        self.store.register('one','repair-one',repairs_batch=parent['id']);self.store.ready('repair-one','b'*40,VALID)
+        epoch=self.store.claim(scope,'owner-two');child=self.store.create_batch('one','owner-two',epoch);self.store.fail(child['id'],'owner-two',epoch,'second failure');self.store.release(scope,'owner-two',epoch)
+        with self.assertRaises(Conflict):self.store.register('one','stale-repair',repairs_batch=parent['id'])
+        self.assertIsNone(self.store.due('one'))
+        self.store.register('one','current-repair',repairs_batch=child['id']);self.store.ready('current-repair','d'*40,VALID)
+        self.assertTrue(self.store.due('one')['due'])
+
     def test_atomic_claim_between_connections(self):
         scope=self.store.project('one')['scope'];barrier=threading.Barrier(3);wins=[]
         def claim(owner):
@@ -80,6 +92,24 @@ class StoreTests(unittest.TestCase):
         barrier.wait()
         for t in threads:t.join()
         self.assertEqual(sum(x is not None for x in wins),1)
+
+    def test_existing_state_database_migrates_recovery_columns(self):
+        path=self.root/'legacy'/'state.sqlite3';path.parent.mkdir()
+        with sqlite3.connect(path) as db:
+            db.executescript('''
+                CREATE TABLE projects(id TEXT PRIMARY KEY, scope TEXT NOT NULL, config TEXT NOT NULL);
+                CREATE TABLE tasks(id TEXT PRIMARY KEY, project TEXT NOT NULL, state TEXT NOT NULL,
+                    sha TEXT, validation TEXT, created REAL NOT NULL, updated REAL NOT NULL, ready_at REAL,
+                    urgent INTEGER NOT NULL DEFAULT 0, separate INTEGER NOT NULL DEFAULT 0, batch TEXT);
+                CREATE TABLE batches(id TEXT PRIMARY KEY, project TEXT NOT NULL, scope TEXT NOT NULL,
+                    state TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, data TEXT NOT NULL, error TEXT);
+            ''')
+        Store(path.parent)
+        with sqlite3.connect(path) as db:
+            tasks={row[1] for row in db.execute('PRAGMA table_info(tasks)')}
+            batches={row[1] for row in db.execute('PRAGMA table_info(batches)')}
+        self.assertTrue({'repairs_batch','recovered_by'} <= tasks)
+        self.assertIn('recovery_of',batches)
 
 
 FAKE='''import argparse,json,time
@@ -124,7 +154,7 @@ class WorkerTests(unittest.TestCase):
         batches=self.store.snapshot()['batches'];self.assertEqual([b['state'] for b in batches],['complete','complete'])
     def test_response_loss_is_reconciled_without_second_publish(self):
         self.repository('one',{'lose_response':True});Worker(self.store,'one').run()
-        batch=self.store.snapshot()['batches'][0];self.assertEqual(batch['state'],'failed');frozen=batch['data']['frozen']
+        batch=self.store.snapshot()['batches'][0];self.assertEqual(batch['state'],'recovering');frozen=batch['data']['frozen']
         self.store.resume(batch['id']);Worker(self.store,'one').run(batch['id'])
         complete=self.store.batch(batch['id']);self.assertEqual(complete['state'],'complete');self.assertEqual(complete['data']['frozen'],frozen)
         counter=self.root/'state/effects'/(batch['id']+'-publish.count');self.assertEqual(counter.read_text(),'1')
@@ -137,18 +167,57 @@ class WorkerTests(unittest.TestCase):
         batch=self.store.snapshot()['batches'][0];self.assertEqual(batch['state'],'failed');self.assertTrue(Path(batch['data']['workspace']).exists())
         self.assertNotIn('frozen',batch['data']);self.assertFalse((self.root/'state/effects').exists())
 
+    def test_linked_repair_inherits_failed_task_and_preserves_failure_record(self):
+        repo,config=self.repository('one')
+        parent=Worker(self.store,'one').run()
+        self.assertEqual(self.store.batch(parent['id'])['state'],'complete')
+        with self.store.tx() as db:
+            db.execute("UPDATE batches SET state='failed',error='artifact download failed' WHERE id=?",(parent['id'],))
+        git(repo,'push','origin',parent['frozen']['sha']+':refs/heads/main')
+        self.store.register('one','repair',repairs_batch=parent['id'])
+        git(repo,'checkout','-b','repair',parent['frozen']['sha'])
+        (repo/'file').write_text('repaired');git(repo,'commit','-am','repair');repair_sha=git(repo,'rev-parse','HEAD');git(repo,'push','origin','repair');git(repo,'checkout','main')
+        self.store.ready('repair',repair_sha,VALID)
+        self.assertTrue(self.store.due('one')['due'])
+        owner='repair-owner';epoch=self.store.claim(config['scope'],owner)
+        child_data=self.store.create_batch('one',owner,epoch)
+        self.store.release(config['scope'],owner,epoch)
+        work=Path(child_data['workspace']);git(repo,'fetch','origin','main');git(repo,'worktree','add','--detach',str(work),'origin/main');(work/'.release-batch.json').write_text('{"partial":true}')
+        child=Worker(self.store,'one').run(child_data['id'])
+        if child is None:
+            failed=self.store.batch(child_data['id'])
+            log=self.root/'state/logs'/(child_data['id']+'.log')
+            self.fail(f"recovery batch failed: {failed['error']}\nworkspace={child_data['workspace']}\n{log.read_text() if log.exists() else 'no log'}")
+        self.assertEqual(self.store.batch(child['id'])['state'],'complete')
+        self.assertEqual(child['recoveryOf'],parent['id'])
+        self.assertEqual({t['id'] for t in child['tasks']},{'one-task','repair'})
+        self.assertEqual(child['newTaskIds'],['repair'])
+        self.assertEqual(self.store.task('one-task')['state'],'recovered')
+        self.assertEqual(self.store.task('one-task')['recovered_by'],child['id'])
+        self.assertEqual(self.store.task('repair')['state'],'complete')
+        self.assertEqual(self.store.batch(parent['id'])['state'],'failed')
+        self.assertEqual(self.store.batch(parent['id'])['error'],'artifact download failed')
+        for task in child['tasks']:
+            self.assertEqual(subprocess.run(['git','-C',str(child['workspace']),'merge-base','--is-ancestor',task['sha'],child['frozen']['sha']]).returncode,0)
+        self.assertIsNone(self.store.due('one'))
+
 
 class ServiceTests(unittest.TestCase):
     def test_socket_health_and_restart_preserves_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)/'state';source=Path(__file__).resolve().parents[1]
             for attempt in range(2):
-                proc=subprocess.Popen([sys.executable,'-B','-m','release_coordinator','--state-dir',str(root),'serve'],cwd=source,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                env={**os.environ,'RELEASE_COORDINATOR_SOCKET':str(root/'service.sock')}
+                proc=subprocess.Popen([sys.executable,'-B','-m','release_coordinator','--state-dir',str(root),'serve'],cwd=source,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                 try:
                     for _ in range(100):
                         try:health=call(root,'GET','/health');break
                         except OSError:time.sleep(.03)
-                    else:self.fail('service did not start')
+                    else:
+                        stdout,stderr=proc.communicate(timeout=2)
+                        if b'Operation not permitted' in stderr:
+                            self.skipTest('sandbox denies UNIX socket creation')
+                        self.fail(f'service did not start; exit={proc.returncode}; stdout={stdout!r}; stderr={stderr!r}')
                     self.assertTrue(health['ok']);self.assertEqual((root/'service.sock').stat().st_mode&0o777,0o600)
                     if attempt==0:
                         call(root,'POST','/project',{'id':'one','repository':directory,'remote':'example','target':'app','environment':'prod','adapter':['python3','adapter.py']})
