@@ -8,8 +8,9 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
-from release_coordinator.engine import Worker
+from release_coordinator.engine import Worker, Scheduler
 from release_coordinator.store import Store, Conflict
 from release_coordinator.cli import call
 
@@ -83,6 +84,23 @@ class StoreTests(unittest.TestCase):
         self.store.register('one','current-repair',repairs_batch=child['id']);self.store.ready('current-repair','d'*40,VALID)
         self.assertTrue(self.store.due('one')['due'])
 
+    def test_scheduler_resumes_child_despite_failed_parent(self):
+        self.ready('original');scope=self.store.project('one')['scope'];epoch=self.store.claim(scope,'owner')
+        parent=self.store.create_batch('one','owner',epoch);self.store.fail(parent['id'],'owner',epoch,'failure');self.store.release(scope,'owner',epoch)
+        self.ready('repair',repairs_batch=parent['id']);epoch=self.store.claim(scope,'repair-owner')
+        child=self.store.create_batch('one','repair-owner',epoch);self.store.release(scope,'repair-owner',epoch)
+        scheduler=Scheduler(self.store)
+        with patch('release_coordinator.engine.Worker.run') as run:
+            scheduler.tick()
+            for thread,worker in scheduler.workers.values():thread.join(2)
+            run.assert_called_once_with(child['id'])
+
+    def test_legacy_batch_completion_marks_own_tasks_complete(self):
+        self.ready('original');scope=self.store.project('one')['scope'];epoch=self.store.claim(scope,'owner')
+        batch=self.store.create_batch('one','owner',epoch);batch.pop('newTaskIds')
+        self.store.save(batch['id'],'owner',epoch,batch,'complete')
+        self.assertEqual(self.store.task('original')['state'],'complete')
+
     def test_atomic_claim_between_connections(self):
         scope=self.store.project('one')['scope'];barrier=threading.Barrier(3);wins=[]
         def claim(owner):
@@ -118,6 +136,7 @@ p=argparse.ArgumentParser();p.add_argument('action');p.add_argument('phase');p.a
 d=json.loads(Path(a.context).read_text());base=Path(a.context).parent.parent/'effects';base.mkdir(exist_ok=True)
 marker=base/(d['id']+'-'+a.phase+'.json');options=d['config'].get('options',{})
 if a.action=='run':
+ if a.phase=='publish' and options.get('fail_publish'):raise RuntimeError('permanent publish failure')
  if a.phase=='publish' and options.get('barrier'):
   started=base/(d['id']+'.started');started.write_text(str(time.time()))
   end=time.time()+10
@@ -154,12 +173,20 @@ class WorkerTests(unittest.TestCase):
         batches=self.store.snapshot()['batches'];self.assertEqual([b['state'] for b in batches],['complete','complete'])
     def test_response_loss_is_reconciled_without_second_publish(self):
         self.repository('one',{'lose_response':True});Worker(self.store,'one').run()
-        batch=self.store.snapshot()['batches'][0];self.assertEqual(batch['state'],'recovering');frozen=batch['data']['frozen']
-        self.store.resume(batch['id']);Worker(self.store,'one').run(batch['id'])
+        batch=self.store.snapshot()['batches'][0];self.assertEqual(batch['state'],'complete');frozen=batch['data']['frozen']
         complete=self.store.batch(batch['id']);self.assertEqual(complete['state'],'complete');self.assertEqual(complete['data']['frozen'],frozen)
         counter=self.root/'state/effects'/(batch['id']+'-publish.count');self.assertEqual(counter.read_text(),'1')
         self.assertEqual(self.store.task('one-task')['state'],'complete')
         self.assertTrue((self.root/'state/receipts'/(batch['id']+'.json')).exists())
+    def test_permanent_phase_failure_retains_diagnostics_without_auto_retry(self):
+        self.repository('one',{'fail_publish':True});Worker(self.store,'one').run()
+        batch=self.store.snapshot()['batches'][0]
+        self.assertEqual(batch['state'],'failed')
+        self.assertIn('permanent publish failure',batch['error'])
+        self.assertIn('frozen',batch['data'])
+        scheduler=Scheduler(self.store);scheduler.tick()
+        self.assertFalse(scheduler.workers)
+
     def test_merge_conflict_keeps_worktree_and_does_not_publish(self):
         repo,config=self.repository('one');base=git(repo,'rev-parse','main')
         git(repo,'checkout','-b','conflict',base);(repo/'file').write_text('incompatible');git(repo,'commit','-am','conflict');sha=git(repo,'rev-parse','HEAD');git(repo,'push','origin','conflict');git(repo,'checkout','main')
@@ -207,8 +234,7 @@ class ServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)/'state';source=Path(__file__).resolve().parents[1]
             for attempt in range(2):
-                env={**os.environ,'RELEASE_COORDINATOR_SOCKET':str(root/'service.sock')}
-                proc=subprocess.Popen([sys.executable,'-B','-m','release_coordinator','--state-dir',str(root),'serve'],cwd=source,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                proc=subprocess.Popen([sys.executable,'-B','-m','release_coordinator','--state-dir',str(root),'serve'],cwd=source,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                 try:
                     for _ in range(100):
                         try:health=call(root,'GET','/health');break

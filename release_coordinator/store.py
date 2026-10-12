@@ -109,12 +109,6 @@ class Store:
         task_id = task_id or str(uuid.uuid4())
         now = self.clock()
         with self.tx() as db:
-            parent=None
-            if repairs_batch:
-                parent=db.execute('SELECT * FROM batches WHERE id=?',(repairs_batch,)).fetchone()
-                if not parent or parent['project']!=project or parent['state']!='failed':raise Conflict('Recovery must reference a failed batch in this project scope')
-                if db.execute('SELECT 1 FROM batches WHERE recovery_of=?',(repairs_batch,)).fetchone():
-                    raise Conflict('Recovery must reference the latest failed leaf batch')
             old = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
             if old:
                 if old['project'] != project:
@@ -122,6 +116,12 @@ class Store:
                 if old['repairs_batch'] != repairs_batch:
                     raise Conflict('Task ID is already registered with a different recovery target')
                 return dict(old)
+            parent=None
+            if repairs_batch:
+                parent=db.execute('SELECT * FROM batches WHERE id=?',(repairs_batch,)).fetchone()
+                if not parent or parent['project']!=project or parent['state']!='failed':raise Conflict('Recovery must reference a failed batch in this project scope')
+                if db.execute('SELECT 1 FROM batches WHERE recovery_of=?',(repairs_batch,)).fetchone():
+                    raise Conflict('Recovery must reference the latest failed leaf batch')
             db.execute('INSERT INTO tasks(id,project,state,created,updated,urgent,separate,repairs_batch) VALUES(?,?,?,?,?,?,?,?)',
                        (task_id,project,'active',now,now,int(urgent),int(separate),repairs_batch))
             value=dict(db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
@@ -280,7 +280,7 @@ class Store:
                 raise Conflict('Frozen description is immutable')
             db.execute('UPDATE batches SET data=?,state=?,updated=?,error=NULL WHERE id=?', (encode(data),state,now,batch_id))
             if state=='complete':
-                for task_id in data.get('newTaskIds',[]):
+                for task_id in data.get('newTaskIds',[task['id'] for task in data['tasks']]):
                     db.execute("UPDATE tasks SET state='complete' WHERE batch=? AND id=?",(batch_id,task_id))
                 if data.get('recoveryOf'):
                     for task in data['tasks']:

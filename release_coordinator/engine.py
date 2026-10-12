@@ -93,10 +93,6 @@ class Worker:
             raise RuntimeError('Unexpected integration worktree')
         if (Path(self.git(work,'rev-parse','--git-dir'))/'MERGE_HEAD').exists():
             raise RuntimeError('Resolve and commit the merge conflict in the retained worktree, then resume')
-        if data.get('recoveryOf'):
-            self.git(work,'checkout','--detach','origin/'+self.config['branch'])
-            self.git(work,'reset','--hard','origin/'+self.config['branch'])
-            self.git(work,'clean','-ffd')
         for task in data['tasks']:
             # Fetch by immutable SHA; readiness is never a mutable branch name.
             self.git(repo,'fetch','origin',task['sha'])
@@ -168,8 +164,16 @@ class Worker:
                 result=self.adapter(data,'check',phase)
                 if not result.get('done'):
                     self.store.step(data['id'],phase,'executing',{},self.owner,self.epoch)
-                    self.adapter(data,'run',phase)
-                    result=self.adapter(data,'check',phase)
+                    try:
+                        self.adapter(data,'run',phase)
+                    except Exception as action_error:
+                        self.guard()
+                        # A response can be lost after an external effect succeeds.
+                        # Reconcile once; keep a real failure and its diagnostics immutable.
+                        try:result=self.adapter(data,'check',phase)
+                        except Exception:raise action_error
+                        if result.get('done') is not True:raise action_error
+                    else:result=self.adapter(data,'check',phase)
                 if result.get('done') is not True:
                     raise RuntimeError('Remote phase not verified: '+phase)
                 data['results'][phase]=result.get('result',{})
@@ -180,6 +184,8 @@ class Worker:
             receipt={k:data[k] for k in ('id','project','scope','tasks','frozen','results')}
             from . import __version__
             receipt['coordinatorVersion']=__version__
+            receipt['recoveryOf']=data.get('recoveryOf')
+            receipt['recoveryChain']=data.get('recoveryChain',[])
             receipt['completedAt']=self.store.clock()
             atomic_json(self.store.root/'receipts'/(data['id']+'.json'),receipt)
             data['receipt']=receipt
@@ -188,7 +194,7 @@ class Worker:
         except Exception as e:
             if data:
                 with contextlib.suppress(Conflict):
-                    if self.stop.is_set() or data.get('frozen') and self.store.batch(data['id'])['state'] in ('running','recovering'):
+                    if self.stop.is_set():
                         self.store.save(data['id'],self.owner,self.epoch,data,'recovering')
                     else:self.store.fail(data['id'],self.owner,self.epoch,e)
             else:raise
@@ -213,15 +219,12 @@ class Scheduler:
                 if preflight.exists():
                     check=json.loads(preflight.read_text())
                     if not check['ok'] and time.time()-check['checkedAt']<30:continue
-                unresolved=[b for b in snapshot['batches'] if b['scope']==config['scope'] and b['state']!='complete']
+                interrupted=[b for b in snapshot['batches'] if b['scope']==config['scope'] and b['state'] not in ('complete','failed')]
                 batch=None
-                if unresolved:
-                    row=unresolved[0]
+                if interrupted:
+                    row=interrupted[0]
                     if row['project']!=config['id']:continue
-                    if row['state']=='failed':
-                        candidate=self.store.due(config['id'])
-                        if not candidate or not candidate['due']:continue
-                    else:batch=row['id']
+                    batch=row['id']
                 else:
                     candidate=self.store.due(config['id'])
                     if not candidate or not candidate['due']:continue

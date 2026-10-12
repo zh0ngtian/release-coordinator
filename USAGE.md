@@ -19,7 +19,7 @@
 6. 每个阶段先 `check` 再 `run`，执行后再次 `check`。中断后的负责人先核对实际远端
    构建、发布和部署状态；同一个成功操作不重复签名、发包或部署。适配器须记录可恢复
    的远端操作 ID；不把“已触发”当成“已成功”。
-7. 只有 task 状态为 `complete` 且共同 receipt 中所有项目完成条件已验证才交付。
+7. 只有 task 状态为 `complete`，或为 `recovered` 且引用成功子批次，并且共同 receipt 中所有项目完成条件已验证才交付。
    中断批次等待租约到期后继续 reconcile；failed 批次与历史产物保持不变，通过
    `register --repairs-batch FAILED_BATCH_ID` 建立显式关联修复任务，并以更高版本交付
    修复。冻结后的版本与提交不可原地更换。
