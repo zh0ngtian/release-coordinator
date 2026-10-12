@@ -11,6 +11,7 @@ import pwd
 import shutil
 import subprocess
 import sys
+import time
 
 
 def install(source, home, python, user, system=False, plan=False):
@@ -74,7 +75,12 @@ def install(source, home, python, user, system=False, plan=False):
     receipt={k:v for k,v in result.items() if k!='job'};receipt['runtimeDigest']=digest.hexdigest()
     (state/'installation.json').write_text(json.dumps(receipt,indent=2)+'\n');(state/'installation.json').chmod(0o600)
     if system:os.chown(state/'installation.json',uid,pwd.getpwnam(user).pw_gid)
-    subprocess.run(['launchctl','bootstrap',domain,str(plist)],check=True)
+    # bootout can return before launchd finishes unloading the old job.
+    for attempt in range(12):
+        started=subprocess.run(['launchctl','bootstrap',domain,str(plist)],capture_output=True,text=True)
+        if started.returncode==0:break
+        if attempt==11:raise ValueError('launchd bootstrap failed after bounded retries: '+started.stderr.strip())
+        time.sleep(.5)
     return result
 
 
