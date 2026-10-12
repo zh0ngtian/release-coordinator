@@ -1,0 +1,6 @@
+{
+  "checks": [
+    {"name": "unit", "status": "passed", "evidence": "Replace with your actual command/run and result"},
+    {"name": "functional", "status": "passed", "evidence": "Replace with actual functional acceptance"}
+  ]
+}

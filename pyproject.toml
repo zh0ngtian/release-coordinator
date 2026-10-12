@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "release-coordinator"
+version = "0.1.0"
+description = "Project-isolated, recoverable batch release coordination"
+requires-python = ">=3.9"
+dependencies = []
+license = {text = "MIT"}
+
+[project.scripts]
+releasectl = "release_coordinator.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["release_coordinator*"]

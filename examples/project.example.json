@@ -1,0 +1,12 @@
+{
+  "id": "MY_PROJECT-production",
+  "repository": "/absolute/path/to/my-project",
+  "remote": "https://github.com/OWNER/REPO.git",
+  "branch": "main",
+  "target": "MY_APPLICATION_OR_SERVICE",
+  "environment": "production",
+  "adapter": ["python3", "{workspace}/scripts/my_release_adapter.py"],
+  "phases": ["build", "publish", "verify"],
+  "required_checks": ["unit", "functional"],
+  "options": {}
+}

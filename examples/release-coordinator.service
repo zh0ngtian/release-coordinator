@@ -1,0 +1,18 @@
+[Unit]
+Description=Release Coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_SERVICE_USER
+WorkingDirectory=/absolute/path/to/installed/runtime
+ExecStart=/absolute/path/to/python3 -B -m release_coordinator --state-dir /absolute/private/state serve
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
