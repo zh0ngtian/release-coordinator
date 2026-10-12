@@ -44,15 +44,19 @@ class Worker:
         env={**os.environ,'GIT_TERMINAL_PROMPT':'0'}
         command=[str(x) for x in args]
         # Children are killed if the owner loses its lease. Independent scopes have separate groups.
+        deadline=time.monotonic()+self.config.get('command_timeout',3600)
+        if Path(command[0]).name=='git':deadline=min(deadline,time.monotonic()+180)
         with subprocess.Popen(command,cwd=cwd,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                               text=True,start_new_session=True) as proc:
             while True:
                 try:
                     out,err=proc.communicate(timeout=2);break
                 except subprocess.TimeoutExpired:
-                    try:self.guard()
+                    try:
+                        self.guard()
+                        if time.monotonic()>deadline:raise TimeoutError('Command deadline exceeded; retained batch can be resumed')
                     except BaseException:
-                        os.killpg(proc.pid,signal.SIGTERM)
+                        with contextlib.suppress(ProcessLookupError):os.killpg(proc.pid,signal.SIGTERM)
                         try:proc.communicate(timeout=5)
                         except subprocess.TimeoutExpired:os.killpg(proc.pid,signal.SIGKILL);proc.communicate()
                         raise
@@ -65,7 +69,7 @@ class Worker:
         return out.strip()
 
     def git(self, repo, *args):
-        return self.process(['git','-C',str(repo),*args])
+        return self.process(['git','-c','http.version=HTTP/1.1','-C',str(repo),*args])
 
     def adapter(self, data, action, phase):
         context=self.store.root/'contexts'/(data['id']+'.json')
@@ -170,6 +174,8 @@ class Worker:
             for task in data['tasks']:
                 self.git(work,'merge-base','--is-ancestor',task['sha'],sha)
             receipt={k:data[k] for k in ('id','project','scope','tasks','frozen','results')}
+            from . import __version__
+            receipt['coordinatorVersion']=__version__
             receipt['completedAt']=self.store.clock()
             atomic_json(self.store.root/'receipts'/(data['id']+'.json'),receipt)
             data['receipt']=receipt
