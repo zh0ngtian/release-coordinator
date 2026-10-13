@@ -43,6 +43,7 @@ class Store:
             task_columns={r[1] for r in db.execute('PRAGMA table_info(tasks)')}
             if 'repairs_batch' not in task_columns:db.execute('ALTER TABLE tasks ADD COLUMN repairs_batch TEXT')
             if 'recovered_by' not in task_columns:db.execute('ALTER TABLE tasks ADD COLUMN recovered_by TEXT')
+            if 'corrects_task' not in task_columns:db.execute('ALTER TABLE tasks ADD COLUMN corrects_task TEXT')
             batch_columns={r[1] for r in db.execute('PRAGMA table_info(batches)')}
             if 'recovery_of' not in batch_columns:db.execute('ALTER TABLE batches ADD COLUMN recovery_of TEXT')
         self.path.chmod(0o600)
@@ -104,7 +105,7 @@ class Store:
             db.execute('INSERT OR REPLACE INTO projects VALUES(?,?,?)', (config['id'],config['scope'],encode(config)))
         return config
 
-    def register(self, project, task_id=None, urgent=False, separate=False, repairs_batch=None):
+    def register(self, project, task_id=None, urgent=False, separate=False, repairs_batch=None, corrects_task=None):
         self.project(project)
         task_id = task_id or str(uuid.uuid4())
         now = self.clock()
@@ -115,18 +116,47 @@ class Store:
                     raise Conflict('Task ID belongs to another project')
                 if old['repairs_batch'] != repairs_batch:
                     raise Conflict('Task ID is already registered with a different recovery target')
-                return dict(old)
+                if old['corrects_task'] != corrects_task:
+                    raise Conflict('Task ID is already registered with a different correction target')
+                return self._task_in(db, task_id)
             parent=None
             if repairs_batch:
                 parent=db.execute('SELECT * FROM batches WHERE id=?',(repairs_batch,)).fetchone()
                 if not parent or parent['project']!=project or parent['state']!='failed':raise Conflict('Recovery must reference a failed batch in this project scope')
                 if db.execute('SELECT 1 FROM batches WHERE recovery_of=?',(repairs_batch,)).fetchone():
                     raise Conflict('Recovery must reference the latest failed leaf batch')
-            db.execute('INSERT INTO tasks(id,project,state,created,updated,urgent,separate,repairs_batch) VALUES(?,?,?,?,?,?,?,?)',
-                       (task_id,project,'active',now,now,int(urgent),int(separate),repairs_batch))
+            if corrects_task:
+                self._correction_source(parent, corrects_task)
+                if db.execute("SELECT 1 FROM tasks WHERE repairs_batch=? AND corrects_task=? AND state!='withdrawn'",(repairs_batch,corrects_task)).fetchone():
+                    raise Conflict('This task already has a pending correction')
+            db.execute('INSERT INTO tasks(id,project,state,created,updated,urgent,separate,repairs_batch,corrects_task) VALUES(?,?,?,?,?,?,?,?,?)',
+                       (task_id,project,'active',now,now,int(urgent),int(separate),repairs_batch,corrects_task))
             value=dict(db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
         value['validation']=json.loads(value['validation']) if value['validation'] else None
         return value
+
+    @staticmethod
+    def _correction_source(parent, task_id):
+        if not parent or parent['state'] != 'failed':
+            raise Conflict('Correction requires a linked failed batch')
+        data = json.loads(parent['data'])
+        if data.get('frozen'):
+            raise Conflict('Frozen batches cannot correct participating commits')
+        source = next((task for task in data['tasks'] if task['id'] == task_id), None)
+        if not source or 'not our ref ' + source['sha'] not in (parent['error'] or ''):
+            raise Conflict('Correction requires a recorded unavailable remote commit')
+        return source
+
+    def _check_pending_correction(self, db, task):
+        if not task['corrects_task']:
+            return
+        parent=db.execute('SELECT * FROM batches WHERE id=?',(task['repairs_batch'],)).fetchone()
+        self._correction_source(parent,task['corrects_task'])
+        if db.execute('SELECT 1 FROM batches WHERE recovery_of=?',(task['repairs_batch'],)).fetchone():
+            raise Conflict('Correction must reference the latest failed leaf batch')
+        if db.execute("SELECT 1 FROM tasks WHERE repairs_batch=? AND corrects_task=? AND id!=? AND state!='withdrawn'",
+                      (task['repairs_batch'],task['corrects_task'],task['id'])).fetchone():
+            raise Conflict('This task already has another pending correction')
 
     def task(self, task_id):
         with self.tx() as db:
@@ -155,11 +185,20 @@ class Store:
                 if task['sha'] == sha and task['validation'] == encode(validation):
                     return self._task_in(db, task_id)
                 raise Conflict('A batched task is immutable; register a new task')
+            self._check_pending_correction(db,task)
             # Repeated ready calls do not restart the collection window.
             ready_at = task['ready_at'] if task['state'] == 'ready' and task['sha'] == sha else now
             db.execute("UPDATE tasks SET state='ready',sha=?,validation=?,ready_at=?,updated=? WHERE id=?",
                        (sha,encode(validation),ready_at,now,task_id))
             return self._task_in(db, task_id)
+
+    def accepted_ready(self, task_id, sha, validation):
+        """Read an identical accepted request without resurrecting withdrawn work."""
+        with self.tx() as db:
+            task=db.execute('SELECT * FROM tasks WHERE id=?',(task_id,)).fetchone()
+            if task and (task['batch'] or task['state']=='ready') and task['sha']==sha and task['validation']==encode(validation):
+                return self._task_in(db,task_id)
+            return None
 
     @staticmethod
     def _task_in(db, task_id):
@@ -176,6 +215,7 @@ class Store:
                 raise Conflict('Unknown or already batched task')
             if state and row['state']=='ready' and state!='withdrawn':
                 raise Conflict('Withdraw the ready task before changing its validated commit')
+            if state and state!='withdrawn':self._check_pending_correction(db,row)
             db.execute('UPDATE tasks SET state=?,updated=? WHERE id=?', (state or row['state'],self.clock(),task_id))
             return self._task_in(db,task_id)
 
@@ -253,10 +293,18 @@ class Store:
             parent_data=json.loads(parent['data']) if parent else {}
             inherited=parent_data.get('tasks',[])
             task_map={t['id']:t for t in [*inherited,*new_tasks]}
+            corrections=list(parent_data.get('corrections',[]))
+            for task in tasks:
+                if task['corrects_task']:
+                    source=self._correction_source(parent,task['corrects_task'])
+                    task_map.pop(source['id'])
+                    corrections.append({'taskId':source['id'],'originalSha':source['sha'],
+                                        'repairTaskId':task['id'],'replacementSha':task['sha']})
             lineage=list(parent_data.get('recoveryChain',[]))+([parent['id']] if parent else [])
             data={'id':batch_id,'project':project,'scope':config['scope'],'recoveryOf':parent['id'] if parent else None,
                   'recoveryChain':lineage,'tasks':list(task_map.values()),'newTaskIds':[t['id'] for t in new_tasks],
                   'config':config,'workspace':str(self.root/'worktrees'/batch_id),'results':{}}
+            if corrections:data['corrections']=corrections
             db.execute('INSERT INTO batches(id,project,scope,state,created,updated,data,error,recovery_of) VALUES(?,?,?,?,?,?,?,NULL,?)', (batch_id,project,config['scope'],'integrating',now,now,encode(data),parent['id'] if parent else None))
             db.executemany("UPDATE tasks SET batch=?,state='batched' WHERE id=?", [(batch_id,t['id']) for t in tasks])
             self._event(db,batch_id,'selected',{'taskIds':[t['id'] for t in tasks]},now)
@@ -276,17 +324,19 @@ class Store:
             row=db.execute('SELECT * FROM batches WHERE id=?',(batch_id,)).fetchone()
             self._guard(db,row['scope'],owner,epoch)
             old=json.loads(row['data'])
-            if old.get('frozen') and any(old.get(k)!=data.get(k) for k in ('frozen','tasks','config','workspace')):
+            if old.get('frozen') and any(old.get(k)!=data.get(k) for k in ('frozen','tasks','config','workspace','corrections')):
                 raise Conflict('Frozen description is immutable')
             db.execute('UPDATE batches SET data=?,state=?,updated=?,error=NULL WHERE id=?', (encode(data),state,now,batch_id))
             if state=='complete':
                 for task_id in data.get('newTaskIds',[task['id'] for task in data['tasks']]):
                     db.execute("UPDATE tasks SET state='complete' WHERE batch=? AND id=?",(batch_id,task_id))
                 if data.get('recoveryOf'):
-                    for task in data['tasks']:
-                        old=db.execute('SELECT batch,state FROM tasks WHERE id=?',(task['id'],)).fetchone()
+                    inherited_ids={task['id'] for task in data['tasks']}
+                    inherited_ids.update(item['taskId'] for item in data.get('corrections',[]))
+                    for task_id in inherited_ids:
+                        old=db.execute('SELECT batch,state FROM tasks WHERE id=?',(task_id,)).fetchone()
                         if old and old['batch']!=batch_id and old['state'] in ('batched','complete','recovered'):
-                            db.execute("UPDATE tasks SET state='recovered',recovered_by=? WHERE id=?",(batch_id,task['id']))
+                            db.execute("UPDATE tasks SET state='recovered',recovered_by=? WHERE id=?",(batch_id,task_id))
             self._event(db,batch_id,state,{},now)
 
     def step(self, batch_id, phase, state, result, owner, epoch):

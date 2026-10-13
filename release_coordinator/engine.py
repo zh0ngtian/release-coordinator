@@ -114,6 +114,7 @@ class Worker:
                   'target':self.config['target'],'environment':self.config['environment'],
                   'tasks':[{'id':t['id'],'sha':t['sha'],'validation':{'checks':[{'name':c['name'],'status':c['status']} for c in t['validation']['checks']]}} for t in data['tasks']],
                   'prepared':{k:v for k,v in prepared['result'].items() if k in ('version','buildNumber','bundleIdentifier','localValidation','inputFingerprint')}}
+        if data.get('corrections'):manifest['corrections']=data['corrections']
         atomic_json(work/'.release-batch.json',manifest)
         self.git(work,'add','--all')
         if self.git(work,'status','--porcelain'):
@@ -186,6 +187,7 @@ class Worker:
             receipt['coordinatorVersion']=__version__
             receipt['recoveryOf']=data.get('recoveryOf')
             receipt['recoveryChain']=data.get('recoveryChain',[])
+            if data.get('corrections'):receipt['corrections']=data['corrections']
             receipt['completedAt']=self.store.clock()
             atomic_json(self.store.root/'receipts'/(data['id']+'.json'),receipt)
             data['receipt']=receipt

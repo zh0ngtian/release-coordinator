@@ -56,7 +56,7 @@ Copy [project.example.json](examples/project.example.json) to a private location
 ~/.local/bin/releasectl status --task MY_TASK
 ```
 
-`ready` authorizes the configured adapter's automatic release after collection. Register at task start so other tasks are visible; heartbeat at least once a minute while active. A task heartbeat is not the publisher lease heartbeat. Push the development commit to the configured remote before declaring it ready. Required validation names must be passed. `--urgent` skips collection; `--separate` releases that task alone. Interrupted non-failed batches resume after lease expiry; immutable failed batches block only their scope until a linked repair batch completes. Unrelated projects continue.
+`ready` authorizes the configured adapter's automatic release after collection. Register at task start so other tasks are visible; heartbeat at least once a minute while active. A task heartbeat is not the publisher lease heartbeat. Push the development commit to the configured remote before declaring it ready. The service verifies the exact commit in a fresh temporary Git repository; a local unpushed object cannot satisfy this check. Fetch, network, or object-type failures leave readiness unchanged. Identical accepted requests can be retried without remote access; withdrawn requests require verification again. Required validation names must be passed. `--urgent` skips collection; `--separate` releases that task alone. Interrupted non-failed batches resume after lease expiry; immutable failed batches block only their scope until a linked repair batch completes. Unrelated projects continue.
 
 ## Adapter contract
 
@@ -88,6 +88,17 @@ A manifest cannot embed the hash of its own commit. CI should derive the final S
 ```
 
 Interrupted integrating/building batches resume automatically after lease expiry; recovery reconciles remote effects first. A failed batch remains immutable and cannot be resumed in place. Register a new task explicitly linked with `--repairs-batch`, push its fixed repair SHA, and mark it ready; the child batch includes the failed task lineage. Resolve an integration conflict in its retained worktree and use that resolution commit in the linked repair task. Never edit a frozen worktree or move a published tag. If an immutable stage is incomplete, the adapter selects a linked repair using a higher version as required by the project. A successful child marks its inherited tasks `recovered` and publishes one receipt including recovery lineage; the original failure record remains available. If an action errors after an external effect, the worker reconciles once before marking failure. A verified effect is not repeated; a persistent error retains diagnostics and blocks its scope instead of automatically looping.
+
+If a pre-freeze failure explicitly records `not our ref` for an incorrectly registered SHA, ordinary recovery will inherit that unavailable commit. Use an explicit correction against the latest failed leaf:
+
+```sh
+~/.local/bin/releasectl register --project MY_PROJECT --task CORRECTION_TASK \
+  --repairs-batch LATEST_FAILED_BATCH_ID --corrects-task ORIGINAL_TASK
+~/.local/bin/releasectl ready --task CORRECTION_TASK --sha VERIFIED_PUSHED_SHA \
+  --validation /private/path/validation.json
+```
+
+The service verifies that the old remote SHA is still unavailable and the replacement is a pushed commit. The new batch excludes only that unavailable task, retains all other participants, and records both task/SHA pairs under `corrections` in its manifest and receipt. Original task SHAs, failure records and worktrees remain unchanged; successful recovery marks the original task `recovered`. Corrections cannot alter a frozen batch or omit a valid remote commit. Concurrent correction registrations are exclusive; withdrawing one does not let it re-enter after another replaces it.
 
 Update by fetching a reviewed revision, running tests and re-running the installer in the already installed startup mode. Old runtime directories, state and historical artifacts remain. Service shutdown terminates its local command groups, preserves recovery state and does not cancel remote CI jobs. Adapters on recovery check remote status again.
 

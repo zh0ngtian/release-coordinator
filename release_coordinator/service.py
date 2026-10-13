@@ -12,6 +12,7 @@ import time
 from . import __version__
 from .engine import Scheduler
 from .store import Conflict, Store
+from .commits import verify_remote_commit, verify_missing_commit
 
 
 class Server(socketserver.ThreadingMixIn,socketserver.UnixStreamServer):
@@ -44,8 +45,21 @@ class Handler(BaseHTTPRequestHandler):
                 progress=store.root/'progress'/(result['id']+'.json')
                 if progress.exists():result['progress']=json.loads(progress.read_text())
             elif self.command=='POST' and path=='/project':result=store.add_project(payload)
-            elif self.command=='POST' and path=='/task':result=store.register(payload['project'],payload.get('id'),payload.get('urgent',False),payload.get('separate',False),payload.get('repairsBatch'))
-            elif self.command=='POST' and path=='/ready':result=store.ready(payload['id'],payload['sha'],payload['validation'])
+            elif self.command=='POST' and path=='/task':result=store.register(payload['project'],payload.get('id'),payload.get('urgent',False),payload.get('separate',False),payload.get('repairsBatch'),payload.get('correctsTask'))
+            elif self.command=='POST' and path=='/ready':
+                task=store.task(payload['id']);config=store.project(task['project'])
+                accepted=store.accepted_ready(payload['id'],payload['sha'],payload['validation'])
+                if accepted:
+                    result=accepted
+                elif task['batch']:
+                    # An identical accepted request remains idempotent even
+                    # after the remote disappears or the original is pushed.
+                    result=store.ready(payload['id'],payload['sha'],payload['validation'])
+                else:
+                    verify_remote_commit(config,payload['sha'])
+                    if task.get('corrects_task'):
+                        verify_missing_commit(config,store.task(task['corrects_task'])['sha'])
+                    result=store.ready(payload['id'],payload['sha'],payload['validation'])
             elif self.command=='POST' and path=='/heartbeat':result=store.touch(payload['id'],payload.get('state'))
             elif self.command=='POST' and path=='/resume':result=store.resume(payload['batch'])
             else:
