@@ -28,8 +28,8 @@ class StoreTests(unittest.TestCase):
         self.store=Store(self.root/'state',lambda:self.now)
         self.add('one');self.add('two')
     def tearDown(self):self.temp.cleanup()
-    def add(self,name):
-        self.store.add_project({'id':name,'repository':str(self.root),'remote':name,'target':'app','environment':'production','adapter':['python3','adapter.py'],'required_checks':['unit']})
+    def add(self,name,lock_scope=None):
+        self.store.add_project({'id':name,'repository':str(self.root),'remote':name,'target':'app','environment':'production','adapter':['python3','adapter.py'],'required_checks':['unit'],'lock_scope':lock_scope})
     def ready(self,id,project='one',**kw):
         self.store.register(project,id,**kw);return self.store.ready(id,'a'*40,VALID)
     def test_no_peer_immediate_and_unrelated_project_does_not_delay(self):
@@ -66,7 +66,7 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.task('late')['batch'])
         changed=json.loads(json.dumps(batch));changed['tasks'].append({'id':'late','sha':'a'*40})
         with self.assertRaises(Conflict):self.store.save(batch['id'],'owner',epoch,changed,'frozen')
-    def test_failed_batch_blocks_only_its_scope_and_resume_requires_expired_owner(self):
+    def test_failed_batch_blocks_only_its_project_and_resume_requires_expired_owner(self):
         self.ready('first');scope=self.store.project('one')['scope'];epoch=self.store.claim(scope,'owner')
         batch=self.store.create_batch('one','owner',epoch);self.store.fail(batch['id'],'owner',epoch,'failed')
         with self.assertRaises(Conflict):self.store.resume(batch['id'])
@@ -83,6 +83,72 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.due('one'))
         self.store.register('one','current-repair',repairs_batch=child['id']);self.store.ready('current-repair','d'*40,VALID)
         self.assertTrue(self.store.due('one')['due'])
+
+    def test_shared_scope_failure_keeps_other_project_queue_and_history_independent(self):
+        self.add('one','shared-target');self.add('two','shared-target')
+        scope=self.store.project('one')['scope'];self.assertEqual(scope,self.store.project('two')['scope'])
+        self.ready('original');epoch=self.store.claim(scope,'first-owner')
+        failed=self.store.create_batch('one','first-owner',epoch)
+        self.store.fail(failed['id'],'first-owner',epoch,'first project failed');self.store.release(scope,'first-owner',epoch)
+        history=self.store.batch(failed['id']);original=self.store.task('original')
+        self.ready('ordinary-one');self.ready('ordinary-two','two')
+        self.assertIsNone(self.store.due('one'))
+        candidate=self.store.due('two');self.assertIsNotNone(candidate)
+        self.assertEqual([t['id'] for t in candidate['tasks']],['ordinary-two']);self.assertTrue(candidate['due'])
+        epoch=self.store.claim(scope,'second-owner');batch=self.store.create_batch('two','second-owner',epoch)
+        self.assertIsNotNone(batch);self.assertIsNone(batch['recoveryOf']);self.assertEqual(batch['recoveryChain'],[])
+        self.assertEqual([t['id'] for t in batch['tasks']],['ordinary-two'])
+        self.store.save(batch['id'],'second-owner',epoch,batch,'complete');self.store.release(scope,'second-owner',epoch)
+        self.assertEqual(self.store.batch(failed['id']),history);self.assertEqual(self.store.task('original'),original)
+        self.assertEqual(self.store.task('ordinary-two')['state'],'complete');self.assertIsNone(self.store.due('one'))
+        with self.assertRaises(Conflict):self.store.register('two','foreign-repair',repairs_batch=failed['id'])
+        self.ready('own-repair',repairs_batch=failed['id']);epoch=self.store.claim(scope,'repair-owner')
+        repair=self.store.create_batch('one','repair-owner',epoch)
+        self.assertEqual(repair['recoveryOf'],failed['id']);self.assertEqual(repair['recoveryChain'],[failed['id']])
+        self.assertEqual({t['id'] for t in repair['tasks']},{'original','own-repair'})
+        self.assertIsNone(self.store.task('ordinary-one')['batch']);self.assertEqual(self.store.batch(failed['id']),history)
+
+    def test_shared_scope_projects_repair_their_own_latest_failed_leaf(self):
+        self.add('one','shared-target');self.add('two','shared-target');scope=self.store.project('one')['scope']
+        failures={}
+        for project in ('one','two'):
+            self.ready(project+'-original',project);epoch=self.store.claim(scope,project)
+            batch=self.store.create_batch(project,project,epoch);self.assertIsNotNone(batch)
+            self.store.fail(batch['id'],project,epoch,project+' failed');self.store.release(scope,project,epoch)
+            failures[project]=self.store.batch(batch['id']);self.now+=1
+        leaves={}
+        for project,foreign in (('one','two'),('two','one')):
+            with self.assertRaises(Conflict):self.store.register(project,project+'-foreign',repairs_batch=failures[foreign]['id'])
+            self.ready(project+'-repair',project,repairs_batch=failures[project]['id'])
+            candidate=self.store.due(project);self.assertIsNotNone(candidate);self.assertTrue(candidate['due'])
+            epoch=self.store.claim(scope,project);child=self.store.create_batch(project,project,epoch)
+            self.assertIsNotNone(child);self.assertEqual(child['recoveryOf'],failures[project]['id'])
+            self.assertEqual({t['id'] for t in child['tasks']},{project+'-original',project+'-repair'})
+            self.store.fail(child['id'],project,epoch,project+' repair failed');self.store.release(scope,project,epoch)
+            leaves[project]=self.store.batch(child['id']);self.now+=1
+            with self.assertRaises(Conflict):self.store.register(project,project+'-stale',repairs_batch=failures[project]['id'])
+        for project,foreign in (('one','two'),('two','one')):
+            with self.assertRaises(Conflict):self.store.register(project,project+'-foreign-leaf',repairs_batch=leaves[foreign]['id'])
+            self.ready(project+'-latest',project,repairs_batch=leaves[project]['id'])
+            epoch=self.store.claim(scope,project);child=self.store.create_batch(project,project,epoch)
+            self.assertIsNotNone(child);self.assertEqual(child['recoveryOf'],leaves[project]['id'])
+            self.assertEqual(child['recoveryChain'],[failures[project]['id'],leaves[project]['id']])
+            self.assertEqual({t['id'] for t in child['tasks']},{project+'-original',project+'-repair',project+'-latest'})
+            self.store.save(child['id'],project,epoch,child,'complete');self.store.release(scope,project,epoch)
+            self.assertEqual(self.store.batch(failures[project]['id']),failures[project])
+            self.assertEqual(self.store.batch(leaves[project]['id']),leaves[project])
+
+    def test_shared_scope_active_batch_and_lease_block_other_project(self):
+        self.add('one','shared-target');self.add('two','shared-target');scope=self.store.project('one')['scope']
+        self.ready('one-ready');self.ready('two-ready','two')
+        epoch=self.store.claim(scope,'one-owner');self.assertIsNone(self.store.claim(scope,'two-owner'))
+        batch=self.store.create_batch('one','one-owner',epoch)
+        self.assertIsNone(self.store.due('two'));self.assertIsNone(self.store.create_batch('two','one-owner',epoch))
+        self.store.release(scope,'one-owner',epoch)
+        self.store.resume(batch['id']);new_epoch=self.store.claim(scope,'two-owner')
+        with self.assertRaises(Conflict):self.store.guard(scope,'one-owner',epoch)
+        self.assertIsNone(self.store.due('two'));self.assertIsNone(self.store.create_batch('two','two-owner',new_epoch))
+        self.assertIsNone(self.store.task('two-ready')['batch'])
 
     def test_scheduler_resumes_child_despite_failed_parent(self):
         self.ready('original');scope=self.store.project('one')['scope'];epoch=self.store.claim(scope,'owner')
@@ -130,13 +196,22 @@ class StoreTests(unittest.TestCase):
         self.assertIn('recovery_of',batches)
 
 
-FAKE='''import argparse,json,time
+FAKE='''import argparse,json,os,time
 from pathlib import Path
 p=argparse.ArgumentParser();p.add_argument('action');p.add_argument('phase');p.add_argument('--context');a=p.parse_args()
 d=json.loads(Path(a.context).read_text());base=Path(a.context).parent.parent/'effects';base.mkdir(exist_ok=True)
 marker=base/(d['id']+'-'+a.phase+'.json');options=d['config'].get('options',{})
 if a.action=='run':
  if a.phase=='publish' and options.get('fail_publish'):raise RuntimeError('permanent publish failure')
+ if a.phase=='publish' and options.get('shared_target'):
+  active=base/'shared-target-active'
+  fd=os.open(active,os.O_CREAT|os.O_EXCL|os.O_WRONLY);os.close(fd)
+  try:
+   (base/(d['id']+'.entered')).write_text('yes')
+   end=time.time()+10
+   while not (base/'shared-target-release').exists() and time.time()<end:time.sleep(.02)
+   if not (base/'shared-target-release').exists():raise RuntimeError('shared target gate timed out')
+  finally:active.unlink()
  if a.phase=='publish' and options.get('barrier'):
   started=base/(d['id']+'.started');started.write_text(str(time.time()))
   end=time.time()+10
@@ -156,13 +231,13 @@ class WorkerTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name);self.store=Store(self.root/'state')
         self.adapter=self.root/'adapter.py';self.adapter.write_text(FAKE)
     def tearDown(self):self.temp.cleanup()
-    def repository(self,name,options=None):
+    def repository(self,name,options=None,lock_scope=None):
         repo=self.root/name;repo.mkdir();git(repo,'init','-b','main');git(repo,'config','user.name','Test');git(repo,'config','user.email','test@example.invalid')
         (repo/'file').write_text('base');git(repo,'add','.');git(repo,'commit','-m','base')
         remote=self.root/(name+'.git');subprocess.check_call(['git','clone','--bare',str(repo),str(remote)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         git(repo,'remote','add','origin',str(remote));git(repo,'checkout','-b','task');(repo/'file').write_text('feature');git(repo,'commit','-am','feature')
         sha=git(repo,'rev-parse','HEAD');git(repo,'push','origin','task');git(repo,'checkout','main')
-        config=self.store.add_project({'id':name,'repository':str(repo),'remote':str(remote),'target':'app','environment':'production','adapter':[sys.executable,str(self.adapter)],'phases':['publish','verify'],'options':options or {}})
+        config=self.store.add_project({'id':name,'repository':str(repo),'remote':str(remote),'target':'app','environment':'production','adapter':[sys.executable,str(self.adapter)],'phases':['publish','verify'],'options':options or {},'lock_scope':lock_scope})
         self.store.register(name,name+'-task');self.store.ready(name+'-task',sha,VALID)
         return repo,config
     def test_distinct_projects_publish_concurrently(self):
@@ -178,6 +253,46 @@ class WorkerTests(unittest.TestCase):
         counter=self.root/'state/effects'/(batch['id']+'-publish.count');self.assertEqual(counter.read_text(),'1')
         self.assertEqual(self.store.task('one-task')['state'],'complete')
         self.assertTrue((self.root/'state/receipts'/(batch['id']+'.json')).exists())
+
+    def test_shared_scope_workers_serialize_the_same_write_target(self):
+        self.repository('one',{'shared_target':True},'shared-target');self.repository('two',{'shared_target':True},'shared-target')
+        barrier=threading.Barrier(3);results=[];errors=[]
+        def publish(project):
+            try:
+                store=Store(self.store.root);barrier.wait();results.append((project,Worker(store,project).run()))
+            except BaseException as error:errors.append(error)
+        threads=[threading.Thread(target=publish,args=(project,)) for project in ('one','two')]
+        for thread in threads:thread.start()
+        barrier.wait();effects=self.store.root/'effects';deadline=time.time()+10
+        try:
+            while time.time()<deadline and (not effects.exists() or not list(effects.glob('*.entered')) or not results):time.sleep(.02)
+            self.assertFalse(errors);self.assertEqual(len(results),1);self.assertIsNone(results[0][1])
+            self.assertEqual(len(list(effects.glob('*.entered'))),1);self.assertTrue((effects/'shared-target-active').exists())
+            self.assertEqual(len(self.store.snapshot()['batches']),1)
+        finally:
+            effects.mkdir(exist_ok=True);(effects/'shared-target-release').write_text('yes')
+            for thread in threads:thread.join(15)
+        self.assertFalse(any(thread.is_alive() for thread in threads));self.assertFalse(errors)
+        self.assertEqual(sum(result is not None for _,result in results),1)
+        losing_project=next(project for project,result in results if result is None)
+        self.assertIsNotNone(Worker(Store(self.store.root),losing_project).run())
+        batches=self.store.snapshot()['batches'];self.assertEqual([batch['state'] for batch in batches],['complete','complete'])
+        self.assertEqual(len(list(effects.glob('*.entered'))),2);self.assertFalse((effects/'shared-target-active').exists())
+        for batch in batches:self.assertEqual((effects/(batch['id']+'-publish.count')).read_text(),'1')
+
+    def test_shared_scope_failure_allows_other_project_response_loss_recovery(self):
+        self.repository('one',{'fail_publish':True},'shared-target');self.repository('two',{'lose_response':True},'shared-target')
+        self.assertIsNone(Worker(self.store,'one').run())
+        failed=self.store.snapshot('one')['batches'][0];original=self.store.task('one-task')
+        self.assertEqual(failed['state'],'failed');self.assertIn('permanent publish failure',failed['error'])
+        result=Worker(Store(self.store.root),'two').run();self.assertIsNotNone(result)
+        self.assertIsNone(result['recoveryOf']);self.assertEqual(result['recoveryChain'],[])
+        self.assertEqual([task['id'] for task in result['tasks']],['two-task'])
+        self.assertEqual(result['receipt']['recoveryChain'],[]);self.assertIsNone(result['receipt']['recoveryOf'])
+        self.assertEqual(self.store.task('two-task')['state'],'complete')
+        self.assertEqual(self.store.batch(failed['id']),failed);self.assertEqual(self.store.task('one-task'),original)
+        self.assertEqual((self.store.root/'effects'/(result['id']+'-publish.count')).read_text(),'1')
+        self.assertTrue((self.store.root/'receipts'/(result['id']+'.json')).exists())
     def test_permanent_phase_failure_retains_diagnostics_without_auto_retry(self):
         self.repository('one',{'fail_publish':True});Worker(self.store,'one').run()
         batch=self.store.snapshot()['batches'][0]

@@ -225,7 +225,7 @@ class Store:
         with self.tx() as db:
             active=db.execute("SELECT 1 FROM batches WHERE scope=? AND state NOT IN ('complete','failed')",(config['scope'],)).fetchone()
             if active:return None
-            parent=db.execute("SELECT * FROM batches WHERE scope=? AND state='failed' AND id NOT IN (SELECT recovery_of FROM batches WHERE recovery_of IS NOT NULL) ORDER BY created DESC LIMIT 1",(config['scope'],)).fetchone()
+            parent=db.execute("SELECT * FROM batches WHERE project=? AND scope=? AND state='failed' AND id NOT IN (SELECT recovery_of FROM batches WHERE recovery_of IS NOT NULL) ORDER BY created DESC LIMIT 1",(project,config['scope'])).fetchone()
             tasks=[dict(r) for r in db.execute("SELECT * FROM tasks WHERE project=? AND state='ready' AND batch IS NULL AND repairs_batch IS ? ORDER BY ready_at,rowid",(project,parent['id'] if parent else None))]
             if not tasks:
                 return None
@@ -279,8 +279,8 @@ class Store:
             self._guard(db,config['scope'],owner,epoch)
             active=db.execute("SELECT 1 FROM batches WHERE scope=? AND state NOT IN ('complete','failed')",(config['scope'],)).fetchone()
             if active:return None
-            parent=db.execute("SELECT * FROM batches WHERE scope=? AND state='failed' AND id NOT IN (SELECT recovery_of FROM batches WHERE recovery_of IS NOT NULL) ORDER BY created DESC LIMIT 1",(config['scope'],)).fetchone()
-            # Recovery tasks explicitly link to the latest failed batch; unrelated ready work cannot unlock it.
+            parent=db.execute("SELECT * FROM batches WHERE project=? AND scope=? AND state='failed' AND id NOT IN (SELECT recovery_of FROM batches WHERE recovery_of IS NOT NULL) ORDER BY created DESC LIMIT 1",(project,config['scope'])).fetchone()
+            # Recovery tasks explicitly link to this project's latest failed batch; unrelated ready work cannot unlock it.
             tasks=[dict(r) for r in db.execute("SELECT * FROM tasks WHERE project=? AND state='ready' AND batch IS NULL AND repairs_batch IS ? ORDER BY ready_at,rowid",(project,parent['id'] if parent else None))]
             if not tasks:
                 return None
