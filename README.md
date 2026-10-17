@@ -115,3 +115,5 @@ For multiple machines, run all commands against the same publishing host using a
 `python3 -B -m unittest discover -s tests -v` covers independent-project concurrent workers, shared-scope worker serialization, project-specific failure leaves and retained history, scoped atomic ownership, stale-owner fencing, bounded collection, separate releases, immutable batches, late tasks, retained merge conflicts, lost-response reconciliation and Unix-socket restart persistence. Real publishing and deployment depend on the project's adapter and require its own integration acceptance.
 
 [0.1.6 本地验证记录](docs/validations/2026-10-17-ancestor-merge-repair.md) 还覆盖真实 Git 后继冲突解决、并列独立任务、重复 SHA、已在正式分支中的任务、远端缺失拒绝、逐任务祖先保护与部分整合后的中断恢复；该记录不代表现役服务已升级。
+
+[0.1.6 本机升级验收](docs/deployments/2026-10-17-0.1.6.md) records the verified descendant-repair merge update, unchanged failed history and retained runtime. User-project delivery still requires its own successful receipt.
