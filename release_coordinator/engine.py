@@ -93,10 +93,15 @@ class Worker:
             raise RuntimeError('Unexpected integration worktree')
         if (Path(self.git(work,'rev-parse','--git-dir'))/'MERGE_HEAD').exists():
             raise RuntimeError('Resolve and commit the merge conflict in the retained worktree, then resume')
-        for task in data['tasks']:
-            # Fetch by immutable SHA; readiness is never a mutable branch name.
-            self.git(repo,'fetch','origin',task['sha'])
-            self.git(work,'merge','--no-ff','--no-edit',task['sha'])
+        task_shas=list(dict.fromkeys(task['sha'] for task in data['tasks']))
+        for sha in task_shas:
+            # Fetch every immutable source before choosing heads; none may be unavailable.
+            self.git(repo,'fetch','origin',sha)
+        # A descendant can contain the explicit conflict resolution for an older task.
+        # Keep every task in the audit and ancestry checks, but merge only independent heads.
+        heads=self.git(work,'merge-base','--independent',*task_shas).splitlines()
+        for sha in heads:
+            self.git(work,'merge','--no-ff','--no-edit',sha)
         self.git(work,'submodule','update','--init','--recursive')
         return work
 
