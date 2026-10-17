@@ -42,3 +42,11 @@
 协调器修复：`~/Library/Application Support/ReleaseCoordinator/validations/project-failure-isolation-20261017/`。
 
 客户端现有 1517 项回归、8 项 iPhone 17 Pro 正常字号竖屏真实 UI 和审查证据：`~/Library/Application Support/CodexMobile/validation/ios-composer-web-controls-20261017/`；客户端源码已经提交推送，不为本次协调器修复重复改动。
+
+## 实际完成记录
+
+- `3ca6fae` 修复经规格与质量审查通过，父任务全量 35/35 通过后推送 main。
+- 现役服务按原 login 模式升级到 `0.1.5`，运行时摘要与源文件一致；旧运行时内容、17 个失败批次完整数据库行、旧任务状态及原启动配置均已核对保留。
+- 独立 OTA 任务无需关联外项目失败，自动形成 `6ff1b518-c973-4e8b-8400-b41b016bc60c` 成功批次。版本 `0.2.189`，冻结源码 `c4d3e94a5513d9fa4a4c62b564281f0b8605ff82`；共同凭证与独立 LAN/HTTPS 完整下载验证通过，没有 GitHub Release、APK 或软件源阶段。
+- 签名 IPA 4,890,013 字节，SHA-256 `8878b5b41b3890ada149d0eebd6720ddccc21b113ec837cbac1527d6b9b13ccd`，升级身份及权限与上一版连续。构建验签和模拟器 UI 不代表真机覆盖安装及数据保留已验收。
+- 详细运行时验收见 [0.1.5 部署记录](../../deployments/2026-10-17-0.1.5.md)；原始私有备份、失败历史与逐项核对记录保留在上述 validation 目录。

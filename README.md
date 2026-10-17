@@ -102,6 +102,8 @@ The service verifies that the old remote SHA is still unavailable and the replac
 
 Update by fetching a reviewed revision, running tests and re-running the installer in the already installed startup mode. Old runtime directories, state and historical artifacts remain. Service shutdown terminates its local command groups, preserves recovery state and does not cancel remote CI jobs. Adapters on recovery check remote status again.
 
+[0.1.5 本机升级验收](docs/deployments/2026-10-17-0.1.5.md) records the verified runtime update, retained history and real shared-lock project isolation acceptance.
+
 For multiple machines, run all commands against the same publishing host using authenticated SSH, for example `ssh publisher '~/.local/bin/releasectl status'`. Development SHAs must exist on the shared Git remote, and validation files must be transferred to that host. Do not create separate coordinator databases per machine or put the SQLite database on a network share. This version does not expose a public HTTP API.
 
 ## Verification
