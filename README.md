@@ -133,3 +133,5 @@ For multiple machines, run all commands against the same publishing host using a
 [0.1.6 本地验证记录](docs/validations/2026-10-17-ancestor-merge-repair.md) 还覆盖真实 Git 后继冲突解决、并列独立任务、重复 SHA、已在正式分支中的任务、远端缺失拒绝、逐任务祖先保护与部分整合后的中断恢复；该记录不代表现役服务已升级。
 
 [0.1.6 本机升级验收](docs/deployments/2026-10-17-0.1.6.md) records the verified descendant-repair merge update, unchanged failed history and retained runtime. User-project delivery still requires its own successful receipt.
+
+[0.1.7 本机升级验收](docs/deployments/2026-10-19-0.1.7.md)记录同批次只读故障恢复、跨阶段退避、写入对账保护与原历史保留的实际安装结果。
