@@ -366,6 +366,8 @@ class Store:
             if 'recovery' in data:
                 data['recovery']['nextAttemptAt']=self.clock()
                 data['recovery']['attentionRequired']=False
+                episode=data.get('recoveryEpisodes',{}).get(data['recovery']['phase'])
+                if episode is not None:episode.update(data['recovery'])
             db.execute("UPDATE batches SET state='recovering',data=?,error=NULL WHERE id=?",(encode(data),batch_id))
             self._event(db,batch_id,'resume-requested',{},self.clock())
         return self.batch(batch_id)

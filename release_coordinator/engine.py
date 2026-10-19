@@ -108,19 +108,26 @@ class Worker:
         result=self.adapter(data,'check',phase)
         if 'retryable' in result:raise RetryRead(phase,result['retryable']['reason'])
         # Only a known answer for the affected phase ends its failure episode.
+        episodes=data.get('recoveryEpisodes',{})
+        episodes.pop(phase,None)
+        if not episodes:data.pop('recoveryEpisodes',None)
         if data.get('recovery',{}).get('phase')==phase:data.pop('recovery')
         return result
 
     def defer_read(self, data, error):
-        now=self.store.clock();old=data.get('recovery',{})
-        if old.get('phase')!=error.phase:old={}
+        now=self.store.clock();episodes=data.setdefault('recoveryEpisodes',{})
+        # Migrate a checkpoint written before per-phase episodes were introduced.
+        current=data.get('recovery')
+        if current:episodes.setdefault(current['phase'],current)
+        old=episodes.get(error.phase,{})
         attempts=old.get('attempts',0)+1;first=old.get('firstFailureAt',now)
         attention=now-first>=900
         data['recovery']={'phase':error.phase,'attempts':attempts,'firstFailureAt':first,
                           'nextAttemptAt':now+(60 if attention else min(60,5*2**min(attempts-1,4)))+random.uniform(0,1),
                           'reason':error.reason,'attentionRequired':attention}
-        self.store.step(data['id'],error.phase,'recovering',data['recovery'],self.owner,self.epoch)
+        episodes[error.phase]=dict(data['recovery'])
         self.store.save(data['id'],self.owner,self.epoch,data,'recovering')
+        self.store.step(data['id'],error.phase,'recovering',data['recovery'],self.owner,self.epoch)
 
     def integrate(self,data):
         repo=Path(self.config['repository']);work=Path(data['workspace'])
@@ -215,6 +222,12 @@ class Worker:
                         raise RuntimeError(data['pendingActionError']['error'])
                     if phase in data['results']:
                         raise RuntimeError('Previously verified remote phase is no longer verified: '+phase)
+                    if data.get('pendingRun',{}).get('phase')==phase:
+                        raise RuntimeError('Remote phase missing after an unverified execution: '+phase)
+                    # Persist before invoking the child, including the response-to-save crash window.
+                    # Only an explicit transient-read response permits idempotent missing-work recovery.
+                    data['pendingRun']={'phase':phase,'startedAt':self.store.clock()}
+                    self.store.save(data['id'],self.owner,self.epoch,data,'running')
                     self.store.step(data['id'],phase,'executing',{},self.owner,self.epoch)
                     try:
                         action_result=self.adapter(data,'run',phase)
@@ -228,11 +241,14 @@ class Worker:
                         except Exception:raise action_error
                         if result.get('done') is not True:raise action_error
                     else:
-                        if 'retryable' in action_result:raise RetryRead(phase,action_result['retryable']['reason'])
+                        if 'retryable' in action_result:
+                            data.pop('pendingRun')
+                            raise RetryRead(phase,action_result['retryable']['reason'])
                         result=self.checked(data,phase)
                 if result.get('done') is not True:
                     raise RuntimeError('Remote phase not verified: '+phase)
                 if data.get('pendingActionError',{}).get('phase')==phase:data.pop('pendingActionError')
+                if data.get('pendingRun',{}).get('phase')==phase:data.pop('pendingRun')
                 data['results'].setdefault(phase,result.get('result',{}))
                 self.store.step(data['id'],phase,'verified',data['results'][phase],self.owner,self.epoch)
                 self.store.save(data['id'],self.owner,self.epoch,data,'running')

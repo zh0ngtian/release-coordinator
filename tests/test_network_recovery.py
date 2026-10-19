@@ -4,6 +4,8 @@ import io
 import json
 from pathlib import Path
 import threading
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -14,7 +16,7 @@ from release_coordinator.store import Store, Conflict
 from release_coordinator.cli import main
 
 
-ADAPTER='''import argparse,json,sys
+ADAPTER='''import argparse,json,sys,os,signal
 from pathlib import Path
 p=argparse.ArgumentParser();p.add_argument('action');p.add_argument('phase');p.add_argument('--context');a=p.parse_args()
 d=json.loads(Path(a.context).read_text());base=Path(a.context).parent.parent/'effects';base.mkdir(exist_ok=True)
@@ -27,10 +29,11 @@ if a.phase=='prepare':
  emit({'done':True,'result':{'version':'1.2.3','buildNumber':'42'}})
 if a.action=='check':
  calls=base/(d['id']+'-'+a.phase+'.checks');calls.write_text(str(int(calls.read_text())+1) if calls.exists() else '1')
+ if mode=='verify-unknown' and a.phase=='publish' and (base/'publish-unknown').exists():unknown()
  if mode=='verify-unknown' and a.phase=='publish' and marker.exists() and (base/'omit-result').exists():emit({'done':True})
  if mode=='malformed':emit(json.loads((base/'response.json').read_text()))
  if (mode=='unknown' or (mode=='verify-unknown' and a.phase=='verify')) and not gate.exists():unknown()
- if marker.exists() and mode in ('after-run','structured-run','lost-success','lost-false') and not gate.exists():unknown()
+ if marker.exists() and mode in ('after-run','after-run-false','structured-run','lost-success','lost-false') and not gate.exists():unknown()
  if mode=='completed-missing' and a.phase=='publish' and (base/'hide').exists():emit({'done':False})
  if mode=='lost-false' and marker.exists():emit({'done':False})
  emit({'done':marker.exists(),'result':json.loads(marker.read_text()) if marker.exists() else {}})
@@ -40,9 +43,11 @@ if mode=='permanent':raise RuntimeError('deterministic build failure')
 count=base/(d['id']+'-'+a.phase+'.count');count.write_text(str(int(count.read_text())+1) if count.exists() else '1')
 result={'runId':d['id']+'-'+a.phase,'sha':d['frozen']['sha'],'version':d['frozen']['version']};marker.write_text(json.dumps(result))
 Path(d['progressPath']).parent.mkdir(exist_ok=True);Path(d['progressPath']).write_text(json.dumps(result))
+if mode=='crash-after-effect' and not (base/'crashed').exists():
+ (base/'crashed').write_text('yes');os.kill(os.getppid(),signal.SIGKILL)
 if mode in ('lost-success','lost-false'):raise RuntimeError('write response lost')
 if mode=='structured-run' and not gate.exists():unknown()
-emit({'done':True,'result':result})
+emit({'done':mode!='after-run-false','result':result})
 '''
 
 
@@ -155,6 +160,38 @@ class NetworkRecoveryTests(unittest.TestCase):
         self.assertTrue(self.batch()['data']['recovery']['attentionRequired']);self.assertEqual(self.count(),1)
         self.online();self.store.resume(first['id']);self.assertIsNotNone(Worker(self.store,'one').run(first['id']))
         self.assertEqual(self.count(),1)
+
+    def test_alternating_unknown_phases_keep_each_unresolved_episode_across_restarts(self):
+        self.setup_project('verify-unknown');Worker(self.store,'one').run();first=self.batch()
+        self.assertEqual(first['data']['recovery']['phase'],'verify')
+        for attempt,at in enumerate((200,400,600,800,1000,1200),2):
+            self.now=at;(self.effects()/'publish-unknown').write_text('yes')
+            Worker(Store(self.store.root,lambda:self.now),'one').run(first['id'])
+            self.assertEqual(self.batch()['data']['recovery']['phase'],'publish')
+            (self.effects()/'publish-unknown').unlink();self.recover();recovery=self.batch()['data']['recovery']
+            self.assertEqual(recovery['phase'],'verify');self.assertEqual(recovery['firstFailureAt'],100)
+            self.assertEqual(recovery['attempts'],attempt)
+            if at>=1000:
+                self.assertTrue(recovery['attentionRequired']);self.assertGreaterEqual(recovery['nextAttemptAt']-self.now,60)
+        self.online();self.assertIsNotNone(self.recover());self.assertEqual(self.count(),1)
+
+    def test_ordinary_run_response_then_unknown_does_not_allow_second_write_after_restart(self):
+        for mode in ('after-run','after-run-false'):
+            with self.subTest(mode=mode):
+                self.tearDown();self.setUp();self.setup_project(mode);Worker(self.store,'one').run();row=self.batch()
+                self.assertEqual(row['state'],'recovering');self.assertEqual(self.count(),1)
+                (self.effects()/(row['id']+'-publish.json')).unlink();self.online()
+                self.assertIsNone(self.recover());self.assertEqual(self.batch()['state'],'failed');self.assertEqual(self.count(),1)
+                self.assertEqual(self.batch()['data']['frozen'],row['data']['frozen'])
+
+    def test_process_death_after_write_keeps_preexecution_guard_against_second_write(self):
+        self.setup_project('crash-after-effect')
+        command='import sys;from release_coordinator.store import Store;from release_coordinator.engine import Worker;Worker(Store(sys.argv[1],lambda:100.),"one").run()'
+        process=subprocess.run([sys.executable,'-B','-c',command,str(self.store.root)],cwd=Path(__file__).resolve().parents[1],capture_output=True,timeout=15)
+        self.assertEqual(process.returncode,-9);row=self.batch();self.assertEqual(self.count(),1)
+        (self.effects()/(row['id']+'-publish.json')).unlink();self.now=200
+        self.assertIsNone(Worker(Store(self.store.root,lambda:self.now),'one').run(row['id']))
+        self.assertEqual(self.batch()['state'],'failed');self.assertEqual(self.count(),1)
 
     def test_completed_evidence_survives_legacy_check_without_result(self):
         self.setup_project('verify-unknown');Worker(self.store,'one').run();first=self.batch()
