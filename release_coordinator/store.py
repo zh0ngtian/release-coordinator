@@ -354,14 +354,19 @@ class Store:
             self._event(db,batch_id,'failed',{'error':str(error)[-8000:]},self.clock())
 
     def resume(self, batch_id):
-        row=self.batch(batch_id)
         with self.tx() as db:
+            row=db.execute('SELECT * FROM batches WHERE id=?',(batch_id,)).fetchone()
+            if not row:raise ValueError('Unknown batch')
             lease=db.execute('SELECT expires FROM leases WHERE scope=?',(row['scope'],)).fetchone()
             if lease and lease[0]>self.clock():raise Conflict('An owner still holds the lease')
             if row['state']=='failed':raise Conflict('Failed batch history is immutable; register a linked repair task with --repairs-batch '+batch_id)
             if row['state'] not in ('integrating','frozen','running','recovering'):
                 raise Conflict('Only an interrupted, non-failed batch can resume')
-            db.execute("UPDATE batches SET state='recovering',error=NULL WHERE id=?",(batch_id,))
+            data=json.loads(row['data'])
+            if 'recovery' in data:
+                data['recovery']['nextAttemptAt']=self.clock()
+                data['recovery']['attentionRequired']=False
+            db.execute("UPDATE batches SET state='recovering',data=?,error=NULL WHERE id=?",(encode(data),batch_id))
             self._event(db,batch_id,'resume-requested',{},self.clock())
         return self.batch(batch_id)
 

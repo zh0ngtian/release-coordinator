@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import signal
 import subprocess
 import threading
@@ -11,6 +12,16 @@ import time
 import uuid
 
 from .store import Conflict, encode
+
+
+class AdapterProtocolError(RuntimeError):
+    pass
+
+
+class RetryRead(Exception):
+    def __init__(self, phase, reason):
+        self.phase=phase;self.reason=reason
+        super().__init__(reason)
 
 
 def atomic_json(path, data):
@@ -79,9 +90,37 @@ class Worker:
         log=self.store.root/'logs'/(data['id']+'.log');log.parent.mkdir(exist_ok=True,mode=0o700)
         output=self.process([*args,action,phase,'--context',str(context)],cwd=data['workspace'],log=log)
         try:result=json.loads(output)
-        except json.JSONDecodeError as e:raise RuntimeError('Adapter must emit one JSON object on stdout; diagnostics go to stderr') from e
-        if not isinstance(result,dict):raise RuntimeError('Adapter result must be an object')
+        except json.JSONDecodeError as e:raise AdapterProtocolError('Adapter must emit one JSON object on stdout; diagnostics go to stderr') from e
+        if not isinstance(result,dict) or type(result.get('done')) is not bool:
+            raise AdapterProtocolError('Adapter result must be an object with boolean done')
+        if 'result' in result and not isinstance(result['result'],dict):
+            raise AdapterProtocolError('Adapter result evidence must be an object')
+        if 'retryable' in result:
+            retry=result['retryable']
+            if (result['done'] is not False or set(result)!={'done','retryable'} or not isinstance(retry,dict)
+                or set(retry)!={'kind','reason'} or retry['kind']!='transient-read'
+                or not isinstance(retry['reason'],str) or not retry['reason'].strip()
+                or len(retry['reason'])>2000 or phase=='prepare'):
+                raise AdapterProtocolError('Invalid transient-read response')
         return result
+
+    def checked(self, data, phase):
+        result=self.adapter(data,'check',phase)
+        if 'retryable' in result:raise RetryRead(phase,result['retryable']['reason'])
+        # Only a known answer for the affected phase ends its failure episode.
+        if data.get('recovery',{}).get('phase')==phase:data.pop('recovery')
+        return result
+
+    def defer_read(self, data, error):
+        now=self.store.clock();old=data.get('recovery',{})
+        if old.get('phase')!=error.phase:old={}
+        attempts=old.get('attempts',0)+1;first=old.get('firstFailureAt',now)
+        attention=now-first>=900
+        data['recovery']={'phase':error.phase,'attempts':attempts,'firstFailureAt':first,
+                          'nextAttemptAt':now+(60 if attention else min(60,5*2**min(attempts-1,4)))+random.uniform(0,1),
+                          'reason':error.reason,'attentionRequired':attention}
+        self.store.step(data['id'],error.phase,'recovering',data['recovery'],self.owner,self.epoch)
+        self.store.save(data['id'],self.owner,self.epoch,data,'recovering')
 
     def integrate(self,data):
         repo=Path(self.config['repository']);work=Path(data['workspace'])
@@ -150,6 +189,9 @@ class Worker:
             if batch_id:
                 row=self.store.batch(batch_id)
                 if row['project']!=self.project:raise ValueError('Wrong project')
+                if row['state'] in ('failed','complete'):return None
+                recovery=row['data'].get('recovery',{})
+                if recovery.get('nextAttemptAt',0)>self.store.clock():return None
                 data=row['data']
             else:data=self.store.create_batch(self.project,self.owner,self.epoch)
             if not data:return None
@@ -167,22 +209,31 @@ class Worker:
             for phase in self.config['phases']:
                 self.store.save(data['id'],self.owner,self.epoch,data,'running')
                 self.store.step(data['id'],phase,'checking',{},self.owner,self.epoch)
-                result=self.adapter(data,'check',phase)
+                result=self.checked(data,phase)
                 if not result.get('done'):
+                    if data.get('pendingActionError',{}).get('phase')==phase:
+                        raise RuntimeError(data['pendingActionError']['error'])
+                    if phase in data['results']:
+                        raise RuntimeError('Previously verified remote phase is no longer verified: '+phase)
                     self.store.step(data['id'],phase,'executing',{},self.owner,self.epoch)
                     try:
-                        self.adapter(data,'run',phase)
+                        action_result=self.adapter(data,'run',phase)
+                    except AdapterProtocolError:raise
                     except Exception as action_error:
                         self.guard()
-                        # A response can be lost after an external effect succeeds.
-                        # Reconcile once; keep a real failure and its diagnostics immutable.
-                        try:result=self.adapter(data,'check',phase)
+                        data['pendingActionError']={'phase':phase,'error':str(action_error)[-8000:]}
+                        self.store.save(data['id'],self.owner,self.epoch,data,'running')
+                        try:result=self.checked(data,phase)
+                        except (RetryRead,AdapterProtocolError):raise
                         except Exception:raise action_error
                         if result.get('done') is not True:raise action_error
-                    else:result=self.adapter(data,'check',phase)
+                    else:
+                        if 'retryable' in action_result:raise RetryRead(phase,action_result['retryable']['reason'])
+                        result=self.checked(data,phase)
                 if result.get('done') is not True:
                     raise RuntimeError('Remote phase not verified: '+phase)
-                data['results'][phase]=result.get('result',{})
+                if data.get('pendingActionError',{}).get('phase')==phase:data.pop('pendingActionError')
+                data['results'].setdefault(phase,result.get('result',{}))
                 self.store.step(data['id'],phase,'verified',data['results'][phase],self.owner,self.epoch)
                 self.store.save(data['id'],self.owner,self.epoch,data,'running')
             for task in data['tasks']:
@@ -198,6 +249,9 @@ class Worker:
             data['receipt']=receipt
             self.store.save(data['id'],self.owner,self.epoch,data,'complete')
             return data
+        except RetryRead as e:
+            with contextlib.suppress(Conflict):self.defer_read(data,e)
+            return None
         except Exception as e:
             if data:
                 with contextlib.suppress(Conflict):
@@ -231,6 +285,8 @@ class Scheduler:
                 if interrupted:
                     row=interrupted[0]
                     if row['project']!=config['id']:continue
+                    recovery=row['data'].get('recovery',{})
+                    if recovery.get('nextAttemptAt',0)>self.store.clock():continue
                     batch=row['id']
                 else:
                     candidate=self.store.due(config['id'])

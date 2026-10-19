@@ -23,7 +23,13 @@
    祖先关系、版本及最终提交，发布脚本只使用该提交的产物。
 6. 每个阶段先 `check` 再 `run`，执行后再次 `check`。中断后的负责人先核对实际远端
    构建、发布和部署状态；同一个成功操作不重复签名、发包或部署。适配器须记录可恢复
-   的远端操作 ID；不把“已触发”当成“已成功”。
+   的远端操作 ID；不把“已触发”当成“已成功”。已完成阶段恢复时只对账，明确缺失则失败，不重复 `run`。
+   自 0.1.7 起，已冻结阶段的只读查询/下载暂时不可确认时返回
+   `{"done":false,"retryable":{"kind":"transient-read","reason":"脱敏原因"}}`，
+   不能当作普通 `done:false`。核心严格校验此响应，保留普通布尔 `done`/对象 `result` 合同；
+   retryable 不得带 result、额外字段或 done:true，reason 为非空且最多 2000 字符。
+   非网络异常、构建明确失败、完整性错误、非法协议和冻结前 prepare/整合继续按原规则失败。
+   先升级核心再让适配器返回新协议，不能向旧核心输出 retryable。
 7. 只有 task 状态为 `complete`，或为 `recovered` 且引用成功子批次，并且共同 receipt 中所有项目完成条件已验证才交付。
    中断批次等待租约到期后继续 reconcile；failed 批次与历史产物保持不变，只阻挡所属
    项目的普通就绪任务，通过 `register --repairs-batch FAILED_BATCH_ID` 显式关联本项目
@@ -34,6 +40,13 @@
    整合冲突应在独立修复分支中合并当前正式分支及旧任务、显式解决并提交推送，以新的
    `--repairs-batch` 关联任务就绪；保留旧失败现场与记录，不能 resume 失败批次或覆写旧任务
    SHA。所有继承任务必须仍是最终提交的祖先，不能用有效后继提交触发 `--corrects-task`。
+   网络未知保留原批次、冻结 SHA、版本、外部操作 ID、checkpoint 和已完成结果，进入 `recovering`；
+   `data.recovery` 记录 phase、attempts、firstFailureAt、nextAttemptAt、脱敏 reason 与 attentionRequired。
+   连续失败按 5/10/20/40/60 秒退避并加 0～1 秒抖动，服务重启不跳过等待；较早健康阶段的对账
+   不清除待恢复阶段的连续故障计时。15 分钟仍未知时 attentionRequired=true，继续按 60 秒加抖动的最大间隔自动查询，
+   `wait` 返回人工关注状态；租约释放后 `resume --batch ID` 立即重查。同作用域保持阻挡，异作用域继续。
+   run 普通异常后对账未知会持久保存原错误；之后查明成功才接纳，查明缺失则以原错误 failed，
+   不再次执行写操作。run 自身返回结构化 transient-read 才可在恢复 check 明确缺失后幂等补齐。
 8. 当前版本提供 macOS/Linux 本机服务和通过 SSH 使用同一发布主机的多机模式。
    登录启动、系统开机启动及真实渠道验收分别确认，不根据文档描述宣称已部署。
 

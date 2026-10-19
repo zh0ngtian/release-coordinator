@@ -16,6 +16,8 @@ A self-hosted release coordinator for multiple development tasks. Python 3.9+, G
 - A single shared receipt per successful batch; queued or frozen tasks are not reported complete.
 - Persistent SQLite state, logs, checkpoints, retained worktrees and receipts across service restarts.
 
+自 0.1.7 起，已冻结批次的适配器可把只读查询或下载暂时无法确认表示为 `transient-read`，同批次持久等待并优先对账；网络未知不会被解释为缺失工作。详见下方合同与恢复规则。
+
 自 0.1.6 起，整合会先从远端获取每个不同任务的精确 SHA，再按 Git 祖先关系选择不被其他参与任务覆盖的合并头。因此，包含旧任务及其显式冲突解决的后继修复提交可直接参与合并，避免在读取解决提交前重复合并旧任务而再次冲突。彼此独立的任务仍全部合并；任何原始远端 SHA 不可用时仍失败。原始任务列表、manifest、冻结记录及 receipt 保留全部任务/SHA，准备后和最终交付前继续逐项核对祖先关系，后继提交不会代替旧任务来源。
 
 This is cooperative release coordination, not repository access control: authorized humans can still bypass the tool or edit CI. Project rules and CI must direct ordinary tasks through the coordinator. Adapters must implement trustworthy remote checks and idempotent recovery. The supplied demonstration adapter creates local markers only and does **not** prove any real release.
@@ -76,6 +78,14 @@ Emit exactly one JSON object on stdout; diagnostics go to stderr:
 {"done": true, "result": {"version": "1.2.3", "buildNumber": "42"}}
 ```
 
+已冻结阶段的 `check`，或在执行过程中遇到只读查询/下载故障的幂等 `run`，可返回：
+
+```json
+{"done": false, "retryable": {"kind": "transient-read", "reason": "已脱敏的暂时查询失败原因"}}
+```
+
+这表示“当前无法确认”，不会触发或重复 `run`。`done` 必须是布尔值；普通响应保留既有 `done/result` 格式，提供的 `result` 必须为对象。暂时故障响应只能包含 `done` 与 `retryable`，后者只能包含上述 `kind` 及非空、最多 2000 字符的脱敏 `reason`；不得同时提供 `result` 或 `done: true`。非法 JSON、矛盾协议、明确构建失败及完整性错误仍进入不可变 `failed`。核心只理解结构化合同，不匹配 EOF 或网络错误字符串。适配器只对确认为只读网络异常的错误输出该响应；其余错误继续抛出。`prepare` 及冻结前整合不适用此恢复合同，仍遵循原有失败规则，不能用它重新分配版本。
+
 `prepare` allocates/reserves the project's version once, applies it and runs necessary merged checks. It must survive retries without allocating a second version. The coordinator commits a sanitized `.release-batch.json` and freezes its introducing commit SHA afterward. `check` reconciles the actual CI/deployment/release, using that frozen SHA and the existing external operation IDs. `run` performs only missing work. A final verification phase must verify every required channel; returning `done: true` means verified completion, not request submission.
 
 The context contains frozen metadata, private project options, prior results and `progressPath`. Write an atomically replaced JSON progress file there to expose CI run IDs while waiting. Results should be shareable status/evidence, not passwords, tokens, provisioning profiles or private keys. Public batch manifests contain only task SHAs, passed check names, version/build and target.
@@ -89,7 +99,11 @@ A manifest cannot embed the hash of its own commit. CI should derive the final S
 ~/.local/bin/releasectl register --project MY_PROJECT --task REPAIR_TASK --repairs-batch FAILED_BATCH_ID
 ```
 
-Interrupted integrating/building batches resume automatically after lease expiry; recovery reconciles remote effects first. A failed batch remains immutable and cannot be resumed in place. Register a new task explicitly linked with `--repairs-batch` to that project's latest failed leaf, push its fixed repair SHA, and mark it ready; the child batch includes only its own project's failed task lineage. A failure in another project cannot be a repair target or become an inherited parent, even with a shared `lock_scope`. Never edit a frozen worktree or move a published tag. If an immutable stage is incomplete, the adapter selects a linked repair using a higher version as required by the project. A successful child marks its inherited tasks `recovered` and publishes one receipt including recovery lineage; the original failure record remains available. If an action errors after an external effect, the worker reconciles once before marking failure. A verified effect is not repeated; a persistent error retains diagnostics and blocks its project's ordinary queue instead of automatically looping. Another project's successful batch does not change that failure or its tasks.
+Interrupted integrating/building batches resume automatically after lease expiry; recovery reconciles remote effects first. A failed batch remains immutable and cannot be resumed in place. Register a new task explicitly linked with `--repairs-batch` to that project's latest failed leaf, push its fixed repair SHA, and mark it ready; the child batch includes only its own project's failed task lineage. A failure in another project cannot be a repair target or become an inherited parent, even with a shared `lock_scope`. Never edit a frozen worktree or move a published tag. If an immutable stage is incomplete, the adapter selects a linked repair using a higher version as required by the project. A successful child marks its inherited tasks `recovered` and publishes one receipt including recovery lineage; the original failure record remains available. If an action errors after an external effect, the worker reconciles before marking failure. A verified effect is not repeated; known failures retain diagnostics and block the project's ordinary queue. Another project's successful batch does not change that failure or its tasks.
+
+网络等待使用现有 `recovering` 状态，保留同一 batch、冻结 SHA、版本、外部操作 ID/checkpoint 与已完成结果。`batch`/`status` 中的 `data.recovery` 持久记录 `phase`、`attempts`、`firstFailureAt`、`nextAttemptAt`、脱敏 `reason` 及 `attentionRequired`。同阶段连续失败按 5、10、20、40、60 秒退避，之后封顶 60 秒，各次加 0～1 秒抖动；服务重启仍遵守时间。只有该阶段取得明确查询结果才结束其故障周期，较早健康阶段的对账不会重置计时。连续 15 分钟无法查询时保留 `recovering` 并设置 `attentionRequired: true`、继续按 60 秒加抖动的最大间隔自动重查；`wait` 可立即返回该状态。`resume --batch BATCH_ID` 可在租约释放后主动重查，不能修改冻结信息、取消远端 CI 或绕过确定性失败。同作用域的新批次继续等待，其他作用域照常执行，租约和 fencing 检查保持生效。
+
+恢复总先 `check`：已完成阶段仅对账，若明确发现结果缺失则失败，不重复其 `run`。若 `run` 普通异常后 `check` 也暂时未知，原写操作错误保存在 `data.pendingActionError` 并等待；随后仅 `check done: true` 能接纳成功，明确 `done: false` 则以原错误进入不可变 `failed`，不能盲目重试写操作。只有 `run` 自身明确返回上述只读故障合同，才允许恢复查询确认缺失后，由适配器幂等补齐工作。运行中再遇只读故障继续保留 checkpoint。升级接入时先安装兼容旧适配器的 0.1.7 核心，再让适配器输出新协议，避免旧核心把未知状态当成缺失工作。
 
 处理整合冲突时，保留原失败 worktree，在独立修复分支中合并当前正式分支与需要覆盖的旧任务，显式解决冲突并提交推送，然后以该 SHA 就绪新的关联修复任务。协调器根据真实提交图选择合并头，且要求所有继承任务仍是最终提交的祖先；真正独立的未解决冲突会继续保留现场并失败。不能用后继 SHA 覆写旧任务记录，也不能 resume 已失败批次；`--corrects-task` 仍只适用于下述已证实远端不可用的 SHA。
 
@@ -113,6 +127,8 @@ For multiple machines, run all commands against the same publishing host using a
 ## Verification
 
 `python3 -B -m unittest discover -s tests -v` covers independent-project concurrent workers, shared-scope worker serialization, project-specific failure leaves and retained history, scoped atomic ownership, stale-owner fencing, bounded collection, separate releases, immutable batches, late tasks, retained merge conflicts, lost-response reconciliation and Unix-socket restart persistence. Real publishing and deployment depend on the project's adapter and require its own integration acceptance.
+
+0.1.7 的真实 Git/子进程测试还覆盖查询未知时禁止执行、一次外部副作用与操作 ID/冻结版本复用、写响应丢失后的成功/失败对账、跨 Store/Worker 重启的退避、后续阶段的连续故障计时、15 分钟人工关注与 wait/resume、同作用域阻塞和异作用域继续、已完成阶段拒绝重复执行、确定性失败及非法协议封闭失败；本地测试不代表现役服务已升级。
 
 [0.1.6 本地验证记录](docs/validations/2026-10-17-ancestor-merge-repair.md) 还覆盖真实 Git 后继冲突解决、并列独立任务、重复 SHA、已在正式分支中的任务、远端缺失拒绝、逐任务祖先保护与部分整合后的中断恢复；该记录不代表现役服务已升级。
 

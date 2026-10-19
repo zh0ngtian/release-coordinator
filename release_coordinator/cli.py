@@ -59,7 +59,7 @@ def main(argv=None):
                 snap=call(root,'GET','/status');task=next((t for t in snap['tasks'] if t['id']==args.task),None)
                 if not task:raise ValueError('Unknown task')
                 batch=next((b for b in snap['batches'] if b['id']==(task.get('recovered_by') or task['batch'])),None)
-                if task['state'] in ('complete','recovered') or (batch and batch['state']=='failed') or time.monotonic()>=deadline:
+                if task['state'] in ('complete','recovered') or (batch and (batch['state']=='failed' or batch['data'].get('recovery',{}).get('attentionRequired'))) or time.monotonic()>=deadline:
                     result={'task':task,'batch':batch};break
                 time.sleep(min(2,max(0,deadline-time.monotonic())))
         else:
